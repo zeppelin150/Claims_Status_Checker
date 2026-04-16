@@ -1,0 +1,15 @@
+mart_reporting_fact_claim_alma_client_insurance_claim_slug,mart_reporting_fact_claim_appointment_started_at_day,mart_reporting_dim_health_plan_network_partner_name,mart_reporting_fact_claim_claim_created_at_day,mart_reporting_fact_claim_claim_status,mart_reporting_fact_claim_claim_submitted_to_kareo_at_day,mart_reporting_fact_claim_claim_adjudication_date_day
+returned-slug-1,2026-01-15T00:00:00.000Z,Cigna,2026-01-20T00:00:00.000Z,Completed - ERA Posted,2026-01-22T00:00:00.000Z,2026-02-10T00:00:00.000Z
+returned-slug-1,2026-01-15T00:00:00.000Z,Aetna,2026-01-21T00:00:00.000Z,rejected,2026-01-23T00:00:00.000Z,2026-02-05T00:00:00.000Z
+pending-slug-2,2026-03-01T00:00:00.000Z,UHC,2026-03-05T00:00:00.000Z,submitted,2026-04-03T00:00:00.000Z,
+aging-slug-3,2025-11-01T00:00:00.000Z,BCBS,2025-11-05T00:00:00.000Z,submitted,2025-12-14T00:00:00.000Z,
+resubmitted-slug-4,2026-02-01T00:00:00.000Z,Cigna,2026-02-05T00:00:00.000Z,resubmitted,2026-02-06T00:00:00.000Z,
+writeoff-slug-5,2026-01-10T00:00:00.000Z,Aetna,2026-01-15T00:00:00.000Z,write_off,2026-01-16T00:00:00.000Z,2026-02-20T00:00:00.000Z
+canceled-slug-6,2026-02-10T00:00:00.000Z,UHC,2026-02-12T00:00:00.000Z,canceled,2026-02-13T00:00:00.000Z,
+iodxmn,2026-03-10T00:00:00.000Z,UHC,2026-03-12T00:00:00.000Z,Completed - ERA Posted,2026-03-15T00:00:00.000Z,2026-04-01T00:00:00.000Z
+vfjuty,2026-03-10T00:00:00.000Z,UHC,2026-03-12T00:00:00.000Z,rejected,2026-03-15T00:00:00.000Z,2026-04-02T00:00:00.000Z
+tyxftl,2026-03-10T00:00:00.000Z,UHC,2026-03-12T00:00:00.000Z,submitted,2026-03-15T00:00:00.000Z,2026-04-05T00:00:00.000Z
+tyuiev,2026-03-10T00:00:00.000Z,UHC,2026-03-12T00:00:00.000Z,submitted,2026-03-15T00:00:00.000Z,
+lopiut,2026-02-20T00:00:00.000Z,Oxford,2026-02-22T00:00:00.000Z,write_off,2026-02-25T00:00:00.000Z,2026-03-10T00:00:00.000Z
+ffmkty,2026-02-20T00:00:00.000Z,Oxford,2026-02-22T00:00:00.000Z,canceled,2026-02-25T00:00:00.000Z,
+yhjklo,2026-02-20T00:00:00.000Z,Oxford,2026-02-22T00:00:00.000Z,Completed - No ERA (see Notes),2026-02-25T00:00:00.000Z,2026-03-15T00:00:00.000Z

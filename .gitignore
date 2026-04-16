@@ -1,0 +1,55 @@
+# ── Secrets & credentials ──
+.env
+.env.*
+!.env.example
+google-service-account.json
+*.json.bak
+*.pem
+*.key
+
+# ── Claude Code ──
+.claude/
+CLAUDE.local.md
+
+# ── Run-specific state (per-environment, not checked in) ──
+.seeder_runs.json
+
+# ── Python ──
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ── Editors / IDEs ──
+.vscode/
+.idea/
+*.sublime-*
+*.swp
+*.swo
+*.swn
+*~
+
+# ── OS cruft ──
+# macOS
+.DS_Store
+.AppleDouble
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+# Office file locks (the "~$filename.xlsx" Office creates while open)
+~$*
+
+# ── CSVs — exclude by default but keep the seed files that define scenarios ──
+*.csv
+!seed_claims_tasks.csv
+!seed_lightdash_sim.csv

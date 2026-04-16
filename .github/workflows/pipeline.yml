@@ -1,0 +1,39 @@
+name: E2E Pipeline
+
+# Runs the full claim-return pipeline: read pending slugs from Sheet1, fetch
+# Lightdash (or sim), compute F-K, write back. Runs on cron and on demand.
+# Idempotent — only touches rows where column F (Return Check) is empty.
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'   # every ~15 min, off the :00/:30 marks
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-pipeline
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install -r requirements.txt
+
+      - name: Run E2E pipeline
+        env:
+          LIGHTDASH_API_URL:            ${{ secrets.LIGHTDASH_API_URL }}
+          LIGHTDASH_API_KEY:            ${{ secrets.LIGHTDASH_API_KEY }}
+          LIGHTDASH_CHART_UUID:         ${{ secrets.LIGHTDASH_CHART_UUID }}
+          LIGHTDASH_PROJECT_UUID:       ${{ secrets.LIGHTDASH_PROJECT_UUID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON:  ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEETS_SPREADSHEET_ID: ${{ secrets.GOOGLE_SHEETS_SPREADSHEET_ID }}
+          ASANA_PAT:                    ${{ secrets.ASANA_PAT }}
+          ASANA_PROJECT_GID:            ${{ secrets.ASANA_PROJECT_GID }}
+        run: python3 test_suite.py e2e

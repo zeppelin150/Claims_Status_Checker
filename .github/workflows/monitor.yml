@@ -1,0 +1,35 @@
+name: WOIP Monitor
+
+# Syncs the Asana "Waiting On Insurance Partner" section into Sheet1 every 5 min.
+# Idempotent — safe to re-run. GitHub enforces a minimum cron cadence of 5 min
+# but often delays 10-15 min under load; actual cadence may vary.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'     # every 5 minutes
+  workflow_dispatch:           # also allow manual trigger
+
+concurrency:
+  group: woip-monitor           # cancel overlapping runs
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install -r requirements.txt
+
+      - name: Run monitor sweep
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON:  ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEETS_SPREADSHEET_ID: ${{ secrets.GOOGLE_SHEETS_SPREADSHEET_ID }}
+          ASANA_PAT:                    ${{ secrets.ASANA_PAT }}
+          ASANA_PROJECT_GID:            ${{ secrets.ASANA_PROJECT_GID }}
+        run: python3 asana_monitor.py

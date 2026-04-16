@@ -1,0 +1,42 @@
+name: Pipeline Test Suite
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_group:
+        description: 'Test group to run'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - lightdash
+          - sheets
+          - asana
+          - e2e
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install -r requirements.txt
+
+      - name: Run tests
+        env:
+          LIGHTDASH_API_URL:           ${{ secrets.LIGHTDASH_API_URL }}
+          LIGHTDASH_API_KEY:           ${{ secrets.LIGHTDASH_API_KEY }}
+          LIGHTDASH_CHART_UUID:        ${{ secrets.LIGHTDASH_CHART_UUID }}
+          LIGHTDASH_PROJECT_UUID:      ${{ secrets.LIGHTDASH_PROJECT_UUID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEETS_SPREADSHEET_ID: ${{ secrets.GOOGLE_SHEETS_SPREADSHEET_ID }}
+          TEST_CLAIM_SLUG:             ${{ secrets.TEST_CLAIM_SLUG }}
+          ASANA_PAT:                   ${{ secrets.ASANA_PAT }}
+          ASANA_PROJECT_GID:           ${{ secrets.ASANA_PROJECT_GID }}
+          ASANA_TEST_TASK_GID:         ${{ secrets.ASANA_TEST_TASK_GID }}
+        run: python3 test_suite.py ${{ github.event.inputs.test_group || 'all' }}

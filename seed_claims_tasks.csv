@@ -1,0 +1,11 @@
+,Associate To Enter,,,,Joey ONLY,,,,,,,
+Claim Slug,Associate,Date added,Asana task,clean claim slug,Return Check,Ticket row count,Ticket TRUE count,Work ticket?,Aging Status,Send to Aging?,PI Inquiry Status,Ticket #
+cl-returned-slug-1,Test User,04/13/2026,https://app.asana.com/0/test/123,returned-slug-1,,,,,,,,
+cl-returned-slug-1b,Test User,04/13/2026,https://app.asana.com/0/test/124,returned-slug-1,,,,,,,,
+cl-pending-slug-2,Test User,04/13/2026,https://app.asana.com/0/test/125,pending-slug-2,,,,,,,,
+cl-aging-slug-3,Test User,04/13/2026,https://app.asana.com/0/test/126,aging-slug-3,,,,,,,,
+cl-resubmitted-slug-4,Test User,04/13/2026,https://app.asana.com/0/test/127,resubmitted-slug-4,,,,,,,,
+cl-writeoff-slug-5,Test User,04/13/2026,https://app.asana.com/0/test/128,writeoff-slug-5,,,,,,,,
+cl-canceled-slug-6,Test User,04/13/2026,https://app.asana.com/0/test/129,canceled-slug-6,,,,,,,,
+cl-not-in-lightdash,Test User,04/13/2026,https://app.asana.com/0/test/130,not-in-lightdash,,,,,,,,
+cl-already-done,Test User,04/12/2026,https://app.asana.com/0/test/131,already-done,TRUE,1,1,WORK,,FALSE,,,
