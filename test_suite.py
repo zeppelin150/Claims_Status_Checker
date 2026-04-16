@@ -177,14 +177,34 @@ def get_sheets_service():
     creds = Credentials.from_service_account_file(sa, scopes=scopes) if os.path.isfile(sa) else Credentials.from_service_account_info(json.loads(sa), scopes=scopes)
     return build("sheets", "v4", credentials=creds)
 
+def _sheets_retry(fn, max_retries=6):
+    """Exponential backoff on Sheets 429 (Read/Write Requests Per Minute Per User)."""
+    from googleapiclient.errors import HttpError
+    delay = 2
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except HttpError as e:
+            status = getattr(e.resp, "status", None)
+            if status == 429 and attempt < max_retries - 1:
+                print(f"    [Sheets 429 — backing off {delay}s (attempt {attempt + 1}/{max_retries})]")
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+                continue
+            raise
+
 def sh_read(svc, sid, rng):
-    return svc.spreadsheets().values().get(spreadsheetId=sid, range=rng).execute().get("values", [])
+    return _sheets_retry(lambda: svc.spreadsheets().values().get(
+        spreadsheetId=sid, range=rng).execute().get("values", []))
 
 def sh_write(svc, sid, rng, vals):
-    svc.spreadsheets().values().update(spreadsheetId=sid, range=rng, valueInputOption="USER_ENTERED", body={"values": vals}).execute()
+    _sheets_retry(lambda: svc.spreadsheets().values().update(
+        spreadsheetId=sid, range=rng, valueInputOption="USER_ENTERED",
+        body={"values": vals}).execute())
 
 def sh_clear(svc, sid, rng):
-    svc.spreadsheets().values().clear(spreadsheetId=sid, range=rng, body={}).execute()
+    _sheets_retry(lambda: svc.spreadsheets().values().clear(
+        spreadsheetId=sid, range=rng, body={}).execute())
 
 def ensure_tab(svc, sid, tab_name):
     """Create a tab if it doesn't exist."""
