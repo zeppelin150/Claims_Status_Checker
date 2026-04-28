@@ -9,6 +9,15 @@ name: Security Scan
 # Optional: repo vars    ENABLE_SCHEDULED_SCANS  (default: true)
 #                        MONITOR_ON_PUSH         (default: true)
 #                        SCAN_DEV_DEPS           (default: false)
+#
+# Hardening notes:
+# - All ${{ ... }} expressions that flow into `run:` blocks are passed
+#   through `env:` to prevent shell injection. Direct interpolation of
+#   user-controlled inputs (workflow_dispatch inputs, repo vars, step
+#   outputs derived from filenames) into shell scripts is a known
+#   GitHub Actions injection vector.
+# - actions/checkout uses persist-credentials: false where the workspace
+#   doesn't need to push back to the repo (all scan jobs).
 # ───────────────────────────────────────────────────────────────────────────
 
 on:
@@ -35,7 +44,6 @@ on:
         type: choice
         options: [low, medium, high, critical]
 
-# Code Scanning needs security-events:write to receive SARIF.
 permissions:
   contents: read
   security-events: write
@@ -53,7 +61,6 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────────
   # detect: figures out manifest, Dockerfile presence, IaC presence.
-  # Other scan jobs read these outputs.
   # ─────────────────────────────────────────────────────────────────────────
   detect:
     needs: gate
@@ -66,19 +73,21 @@ jobs:
       has_iac: ${{ steps.detect.outputs.has_iac }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Detect ecosystem & artifacts
         id: detect
+        env:
+          # User-controllable inputs — pass via env to prevent shell injection.
+          INPUT_MANIFEST: ${{ inputs.manifest_file }}
+          INPUT_PKG_MGR: ${{ inputs.package_manager }}
         run: |
-          MANIFEST="${{ inputs.manifest_file }}"
-          PKG_MGR="${{ inputs.package_manager }}"
+          MANIFEST="$INPUT_MANIFEST"
+          PKG_MGR="$INPUT_PKG_MGR"
           HAS_MANIFEST="false"
 
           # Lockfiles before source manifests — exact pins beat version ranges.
-          # NB: this fixes a bug in earlier versions of this workflow that
-          # preferred requirements.txt over poetry.lock / Pipfile.lock,
-          # which underreported when a Poetry/Pipenv repo also kept a
-          # requirements.txt for compat.
           if [ -z "$MANIFEST" ]; then
             if   [ -f poetry.lock ];          then MANIFEST="poetry.lock";        PKG_MGR="${PKG_MGR:-poetry}";    HAS_MANIFEST="true"
             elif [ -f Pipfile.lock ];         then MANIFEST="Pipfile.lock";       PKG_MGR="${PKG_MGR:-pip}";       HAS_MANIFEST="true"
@@ -98,13 +107,11 @@ jobs:
             HAS_MANIFEST="true"
           fi
 
-          # Container detection
           HAS_DOCKERFILE="false"
           if [ -f Dockerfile ] || [ -f dockerfile ]; then
             HAS_DOCKERFILE="true"
           fi
 
-          # IaC detection — any of these triggers an iac scan
           HAS_IAC="false"
           if find . -type d \( -name node_modules -o -name .git -o -name vendor \) -prune -o \
                     -type f \( -name "*.tf" -o -name "*.tfvars" -o -name "Chart.yaml" \
@@ -130,8 +137,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ─────────────────────────────────────────────────────────────────────────
-  # deps: SCA + monitor. Pinned-dep CVE scan, plus snapshot upload to Snyk
-  # for ongoing CVE notifications between scheduled runs.
+  # deps: SCA + monitor.
   # ─────────────────────────────────────────────────────────────────────────
   deps:
     needs: detect
@@ -139,6 +145,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         if: contains(fromJSON('["pip","poetry"]'), needs.detect.outputs.package_manager)
@@ -153,8 +161,10 @@ jobs:
 
       - name: Install CPU-only PyTorch (only if torch is in deps)
         if: needs.detect.outputs.package_manager == 'pip'
+        env:
+          MANIFEST: ${{ needs.detect.outputs.manifest }}
         run: |
-          if grep -qE '^[[:space:]]*torch([[:space:]<>=!~]|$)' "${{ needs.detect.outputs.manifest }}" 2>/dev/null; then
+          if grep -qE '^[[:space:]]*torch([[:space:]<>=!~]|$)' "$MANIFEST" 2>/dev/null; then
             echo "torch found — installing CPU wheel"
             pip install --index-url https://download.pytorch.org/whl/cpu torch
           else
@@ -163,7 +173,9 @@ jobs:
 
       - name: Install dependencies (pip)
         if: needs.detect.outputs.package_manager == 'pip'
-        run: pip install -r "${{ needs.detect.outputs.manifest }}"
+        env:
+          MANIFEST: ${{ needs.detect.outputs.manifest }}
+        run: pip install -r "$MANIFEST"
 
       - name: Install dependencies (poetry)
         if: needs.detect.outputs.package_manager == 'poetry'
@@ -188,34 +200,38 @@ jobs:
         continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          MANIFEST: ${{ needs.detect.outputs.manifest }}
+          PKG_MGR: ${{ needs.detect.outputs.package_manager }}
+          SCAN_DEV_DEPS: ${{ vars.SCAN_DEV_DEPS }}
+          SEVERITY: ${{ inputs.severity_threshold || 'low' }}
         run: |
           DEV_FLAG=""
-          if [ "${{ vars.SCAN_DEV_DEPS }}" = "true" ]; then DEV_FLAG="--dev"; fi
+          if [ "$SCAN_DEV_DEPS" = "true" ]; then DEV_FLAG="--dev"; fi
           snyk test \
-            --file="${{ needs.detect.outputs.manifest }}" \
-            --package-manager=${{ needs.detect.outputs.package_manager }} \
+            --file="$MANIFEST" \
+            --package-manager="$PKG_MGR" \
             --skip-unresolved \
             $DEV_FLAG \
             --json-file-output=snyk-sca.json \
-            --severity-threshold=${{ inputs.severity_threshold || 'low' }} || true
+            --severity-threshold="$SEVERITY" || true
 
       - name: Snyk SCA test (SARIF)
         continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          MANIFEST: ${{ needs.detect.outputs.manifest }}
+          PKG_MGR: ${{ needs.detect.outputs.package_manager }}
+          SCAN_DEV_DEPS: ${{ vars.SCAN_DEV_DEPS }}
         run: |
           DEV_FLAG=""
-          if [ "${{ vars.SCAN_DEV_DEPS }}" = "true" ]; then DEV_FLAG="--dev"; fi
+          if [ "$SCAN_DEV_DEPS" = "true" ]; then DEV_FLAG="--dev"; fi
           snyk test \
-            --file="${{ needs.detect.outputs.manifest }}" \
-            --package-manager=${{ needs.detect.outputs.package_manager }} \
+            --file="$MANIFEST" \
+            --package-manager="$PKG_MGR" \
             --skip-unresolved \
             $DEV_FLAG \
             --sarif-file-output=snyk-sca.sarif || true
 
-      # snyk monitor — uploads a snapshot to Snyk so they email you when a
-      # new CVE drops against your pinned versions. Only on push to main/cron.
-      # PRs would pollute the project history with every branch state.
       - name: Snyk monitor (push to main / cron only)
         if: |
           (github.event_name == 'push' || github.event_name == 'schedule')
@@ -223,12 +239,15 @@ jobs:
         continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          MANIFEST: ${{ needs.detect.outputs.manifest }}
+          PKG_MGR: ${{ needs.detect.outputs.package_manager }}
+          PROJECT_NAME: ${{ github.repository }}
         run: |
           snyk monitor \
-            --file="${{ needs.detect.outputs.manifest }}" \
-            --package-manager=${{ needs.detect.outputs.package_manager }} \
+            --file="$MANIFEST" \
+            --package-manager="$PKG_MGR" \
             --skip-unresolved \
-            --project-name="${{ github.repository }}" || true
+            --project-name="$PROJECT_NAME" || true
 
       - name: Upload SCA artifacts
         if: always()
@@ -250,14 +269,15 @@ jobs:
           category: snyk-sca
 
   # ─────────────────────────────────────────────────────────────────────────
-  # code: SAST. First-party source code scan. Requires Snyk Code enabled in
-  # the Snyk org. Fails gracefully if not enabled.
+  # code: SAST.
   # ─────────────────────────────────────────────────────────────────────────
   code:
     needs: gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
@@ -269,10 +289,11 @@ jobs:
         continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          SEVERITY: ${{ inputs.severity_threshold || 'low' }}
         run: |
           snyk code test \
             --sarif-file-output=snyk-code.sarif \
-            --severity-threshold=${{ inputs.severity_threshold || 'low' }} || true
+            --severity-threshold="$SEVERITY" || true
 
       - name: Upload Snyk Code SARIF to Code Scanning
         if: always() && hashFiles('snyk-code.sarif') != ''
@@ -291,9 +312,7 @@ jobs:
           retention-days: 30
 
   # ─────────────────────────────────────────────────────────────────────────
-  # container: scans the base image extracted from the last FROM line in
-  # the Dockerfile. Multistage builds are scanned at the production stage.
-  # Doesn't build the image — just resolves the base reference.
+  # container: scan base image from Dockerfile's last FROM.
   # ─────────────────────────────────────────────────────────────────────────
   container:
     needs: detect
@@ -301,6 +320,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
@@ -314,7 +335,6 @@ jobs:
           DOCKERFILE="Dockerfile"
           [ -f dockerfile ] && DOCKERFILE="dockerfile"
           # Last FROM line = production base in multistage builds.
-          # Strips "AS <stage>" suffix automatically via awk $2.
           BASE_IMAGE=$(grep -iE '^[[:space:]]*FROM' "$DOCKERFILE" | tail -1 | awk '{print $2}')
           echo "image=$BASE_IMAGE" >> "$GITHUB_OUTPUT"
           echo "dockerfile=$DOCKERFILE" >> "$GITHUB_OUTPUT"
@@ -324,11 +344,14 @@ jobs:
         continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          BASE_IMAGE: ${{ steps.baseimg.outputs.image }}
+          DOCKERFILE: ${{ steps.baseimg.outputs.dockerfile }}
+          SEVERITY: ${{ inputs.severity_threshold || 'low' }}
         run: |
-          snyk container test "${{ steps.baseimg.outputs.image }}" \
-            --file="${{ steps.baseimg.outputs.dockerfile }}" \
+          snyk container test "$BASE_IMAGE" \
+            --file="$DOCKERFILE" \
             --sarif-file-output=snyk-container.sarif \
-            --severity-threshold=${{ inputs.severity_threshold || 'low' }} || true
+            --severity-threshold="$SEVERITY" || true
 
       - name: Upload container SARIF to Code Scanning
         if: always() && hashFiles('snyk-container.sarif') != ''
@@ -347,7 +370,7 @@ jobs:
           retention-days: 30
 
   # ─────────────────────────────────────────────────────────────────────────
-  # iac: Terraform / K8s / CloudFormation / Helm misconfiguration scan.
+  # iac: Terraform / K8s / CloudFormation / Helm.
   # ─────────────────────────────────────────────────────────────────────────
   iac:
     needs: detect
@@ -355,6 +378,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
@@ -366,10 +391,11 @@ jobs:
         continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          SEVERITY: ${{ inputs.severity_threshold || 'low' }}
         run: |
           snyk iac test . \
             --sarif-file-output=snyk-iac.sarif \
-            --severity-threshold=${{ inputs.severity_threshold || 'low' }} || true
+            --severity-threshold="$SEVERITY" || true
 
       - name: Upload IaC SARIF to Code Scanning
         if: always() && hashFiles('snyk-iac.sarif') != ''
@@ -388,7 +414,7 @@ jobs:
           retention-days: 30
 
   # ─────────────────────────────────────────────────────────────────────────
-  # secrets: gitleaks. Scans full git history for committed credentials.
+  # secrets: gitleaks.
   # ─────────────────────────────────────────────────────────────────────────
   secrets:
     needs: gate
@@ -396,7 +422,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0     # full history for git-history scan
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Install gitleaks
         run: |
@@ -432,14 +459,15 @@ jobs:
           retention-days: 30
 
   # ─────────────────────────────────────────────────────────────────────────
-  # workflow-audit: zizmor. Catches script injection, unpinned actions,
-  # missing permissions blocks in workflow files.
+  # workflow-audit: zizmor.
   # ─────────────────────────────────────────────────────────────────────────
   workflow-audit:
     needs: gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
@@ -470,8 +498,7 @@ jobs:
           retention-days: 30
 
   # ─────────────────────────────────────────────────────────────────────────
-  # sbom: CycloneDX SBOM via syft. Tool-agnostic, free, runs on directories.
-  # Skipped on PRs to save time — SBOM is a release artifact, not a PR check.
+  # sbom: CycloneDX + SPDX via syft.
   # ─────────────────────────────────────────────────────────────────────────
   sbom:
     needs: detect
@@ -479,8 +506,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-      - name: Generate SBOM (CycloneDX + SPDX)
+      - name: Generate SBOM (CycloneDX)
         uses: anchore/sbom-action@v0
         with:
           path: .
@@ -508,7 +537,7 @@ jobs:
           retention-days: 90
 
   # ─────────────────────────────────────────────────────────────────────────
-  # summary: aggregate report. Runs even on partial failure.
+  # summary: aggregate report.
   # ─────────────────────────────────────────────────────────────────────────
   summary:
     needs: [detect, deps, code, container, iac, secrets, workflow-audit, sbom]
@@ -526,31 +555,45 @@ jobs:
           python-version: '3.12'
 
       - name: Build summary
+        env:
+          # GitHub-context values (not user-controllable, but env-var'd for
+          # consistency with the hardening rule and to make the script
+          # injection-safe regardless of source).
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+          TRIGGER: ${{ github.event_name }}
+          RESULT_DEPS: ${{ needs.deps.result }}
+          RESULT_CODE: ${{ needs.code.result }}
+          RESULT_CONTAINER: ${{ needs.container.result }}
+          RESULT_IAC: ${{ needs.iac.result }}
+          RESULT_SECRETS: ${{ needs.secrets.result }}
+          RESULT_WF_AUDIT: ${{ needs.workflow-audit.result }}
+          RESULT_SBOM: ${{ needs.sbom.result }}
         run: |
           {
             echo "## 🛡️ Security Scan Summary"
             echo ""
-            echo "**Repo:** ${{ github.repository }}"
-            echo "**Branch:** ${{ github.ref_name }}"
-            echo "**Commit:** ${{ github.sha }}"
-            echo "**Trigger:** ${{ github.event_name }}"
+            echo "**Repo:** $REPO"
+            echo "**Branch:** $BRANCH"
+            echo "**Commit:** $COMMIT"
+            echo "**Trigger:** $TRIGGER"
             echo "**Date:** $(date -u)"
             echo ""
             echo "### Job results"
             echo ""
             echo "| Scan | Status |"
             echo "|------|--------|"
-            echo "| SCA (deps)        | ${{ needs.deps.result }} |"
-            echo "| SAST (code)       | ${{ needs.code.result }} |"
-            echo "| Container         | ${{ needs.container.result }} |"
-            echo "| IaC               | ${{ needs.iac.result }} |"
-            echo "| Secrets           | ${{ needs.secrets.result }} |"
-            echo "| Workflow audit    | ${{ needs.workflow-audit.result }} |"
-            echo "| SBOM              | ${{ needs.sbom.result }} |"
+            echo "| SCA (deps)        | $RESULT_DEPS |"
+            echo "| SAST (code)       | $RESULT_CODE |"
+            echo "| Container         | $RESULT_CONTAINER |"
+            echo "| IaC               | $RESULT_IAC |"
+            echo "| Secrets           | $RESULT_SECRETS |"
+            echo "| Workflow audit    | $RESULT_WF_AUDIT |"
+            echo "| SBOM              | $RESULT_SBOM |"
             echo ""
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # Aggregate vuln counts from any SARIF files we have
           python3 << 'EOF' >> "$GITHUB_STEP_SUMMARY"
           import json, os, glob
 
