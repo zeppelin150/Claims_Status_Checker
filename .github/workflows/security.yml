@@ -22,9 +22,9 @@ name: Security Scan
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, production]
   pull_request:
-    branches: [main, master]
+    branches: [main, master, production]
   schedule:
     - cron: '0 6 * * 1'     # Mon 06:00 UTC — gated by ENABLE_SCHEDULED_SCANS
   workflow_dispatch:
