@@ -49,18 +49,15 @@ DOTENV_PATH = SCRIPT_DIR / ".env"
 FAKE_SLUG = "FAKE-TEST-SLUG-99999"
 DATA_START_ROW = 3  # Row 1 = section labels, Row 2 = headers
 AGING_THRESHOLD_DAYS = 90
+STALE_DAYS_THRESHOLD = 30  # Post stale-claim comment after this many days of no Lightdash data
+COL_N_INDEX = 13  # Column N (0-indexed) — first date a slug returned no Lightdash data
+COL_O_INDEX = 14  # Column O (0-indexed) — date the stale-claim comment was posted (idempotency)
 COL_Z_INDEX = 25  # Column Z (0-indexed) — stores Asana task GID
 
-# Asana GID constants (from project enumeration)
-ASANA_SECTION_NEW = "1214057491820435"
-ASANA_SECTION_WOIP = "1214057491820441"
-ASANA_FIELD_CX_OPS = "1214057491820411"          # CX/OPs Task Progress
-ASANA_FIELD_CLAIMS_TEXT = "1214062032645344"      # Please Paste The Claims Id...
-ASANA_FIELD_ALL_RETURNED = "1214061953637528"     # Have All Claims Returned
-ASANA_OPT_WOIP = "1214057491820418"              # "waiting on insurance partner "
-ASANA_OPT_NEEDS_FOLLOWUP = "1214057491820415"    # "needs follow-up"
-ASANA_OPT_RETURNED_YES = "1214061953637529"      # "Yes "
-ASANA_OPT_RETURNED_NO = "1214061953637530"       # "No"
+# Asana GIDs are loaded from env vars at call time (late-bound) — see .env.example.
+# Required vars: ASANA_SECTION_NEW, ASANA_SECTION_WOIP, ASANA_FIELD_CX_OPS,
+#   ASANA_FIELD_CLAIMS_TEXT, ASANA_FIELD_ALL_RETURNED,
+#   ASANA_OPT_WOIP, ASANA_OPT_NEEDS_FOLLOWUP, ASANA_OPT_RETURNED_YES, ASANA_OPT_RETURNED_NO
 
 # Lightdash SQL template (used only when LIGHTDASH_API_URL is set)
 SQL_TEMPLATE = """SELECT
@@ -96,6 +93,35 @@ LD_COLUMNS = [LD_SLUG, LD_APPT, LD_PARTNER, LD_CREATED, LD_STATUS, LD_SUBMITTED,
 # Actionable statuses
 ACTIONABLE_STATUSES = {"Completed - No ERA (see Notes)", "Completed - ERA Posted", "rejected", "write_off", "canceled"}
 NON_ACTIONABLE_STATUSES = {"resubmitted"}
+
+
+# ---------------------------------------------------------------------------
+# Dry-run mode
+# ---------------------------------------------------------------------------
+# Global flag — when True, every mutating helper (Sheets writes/clears,
+# Asana POST/PUT/DELETE/PATCH) logs the intended action and skips the API
+# call. Reads (GET) still go through so dry-run can exercise the read path.
+# Set via set_dry_run(True) at script startup.
+_DRY_RUN = False
+
+
+def set_dry_run(enabled: bool) -> None:
+    global _DRY_RUN
+    _DRY_RUN = bool(enabled)
+
+
+def is_dry_run() -> bool:
+    return _DRY_RUN
+
+
+# ---------------------------------------------------------------------------
+# Time
+# ---------------------------------------------------------------------------
+def utc_today():
+    """Today's date in UTC. All date math in this codebase uses UTC so that
+    local-time runs (Windows dev) and CI runs (Ubuntu UTC) agree on the day,
+    and so it lines up with Lightdash's UTC ISO timestamps."""
+    return datetime.now(timezone.utc).date()
 
 
 # ---------------------------------------------------------------------------
@@ -161,20 +187,78 @@ def _extract_rows(data):
         if "status" not in r: return [r]
     return []
 
+def verify_lightdash():
+    """Ping /api/v1/org to fail loud on misconfigured URL or expired API key.
+    No-op when LIGHTDASH_API_URL is unset (sheet-source mode).
+
+    Without this check, a typo in LIGHTDASH_API_URL silently returns empty
+    Lightdash results — every slug is reported as 'no data', e2e exits
+    'PASSED — 0 processed, N no data', and you have to read the logs to
+    notice anything is wrong.
+    """
+    if not has_lightdash():
+        return
+    api_url = env("LIGHTDASH_API_URL").rstrip("/")
+    api_key = env("LIGHTDASH_API_KEY")
+    s, b = ld_request(f"{api_url}/api/v1/org", api_key)
+    if s != 200:
+        raise RuntimeError(
+            f"Lightdash health check failed: status {s} on {api_url}/api/v1/org "
+            f"(check LIGHTDASH_API_URL and LIGHTDASH_API_KEY)"
+        )
+
+
 def build_slug_sql(slugs):
-    safe = [s.replace("'", "''") for s in slugs]
-    return SQL_TEMPLATE.format(slug_list=", ".join(f"'{s}'" for s in safe))
+    # Allow-list: only 6-char alphanumeric slugs reach Lightdash SQL. Makes the
+    # function safe regardless of how callers obtained the input (parser,
+    # sheet cell, future ingest path). Returns None if nothing valid remains.
+    valid = []
+    for s in slugs:
+        norm = str(s).strip().lower()
+        if re.fullmatch(r'[a-z0-9]{6}', norm):
+            valid.append(norm)
+        else:
+            print(f"    [build_slug_sql] dropping invalid slug: {s!r}")
+    if not valid:
+        return None
+    return SQL_TEMPLATE.format(slug_list=", ".join(f"'{s}'" for s in valid))
 
 
 # ---------------------------------------------------------------------------
 # Google Sheets helpers
 # ---------------------------------------------------------------------------
+def _resolve_sa_source():
+    """Pick the service-account credentials source from env vars.
+
+    Returns ('file', path) or ('json', raw_json_str). Raises with a clear
+    message if neither is set or if the file path doesn't exist. FILE wins
+    when both are set — used for local dev (pointing at a JSON on disk).
+    """
+    sa_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
+    sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if sa_file:
+        if not os.path.isfile(sa_file):
+            raise RuntimeError(
+                f"GOOGLE_SERVICE_ACCOUNT_FILE set but file not found: {sa_file}"
+            )
+        return ("file", sa_file)
+    if sa_json:
+        return ("json", sa_json)
+    raise RuntimeError(
+        "Set GOOGLE_SERVICE_ACCOUNT_FILE (path on disk) "
+        "or GOOGLE_SERVICE_ACCOUNT_JSON (raw JSON contents) — neither found"
+    )
+
+
 def get_sheets_service():
     from google.oauth2.service_account import Credentials
     from googleapiclient.discovery import build
-    sa = env("GOOGLE_SERVICE_ACCOUNT_JSON")
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = Credentials.from_service_account_file(sa, scopes=scopes) if os.path.isfile(sa) else Credentials.from_service_account_info(json.loads(sa), scopes=scopes)
+    kind, value = _resolve_sa_source()
+    if kind == "file":
+        creds = Credentials.from_service_account_file(value, scopes=scopes)
+    else:
+        creds = Credentials.from_service_account_info(json.loads(value), scopes=scopes)
     return build("sheets", "v4", credentials=creds)
 
 def _sheets_retry(fn, max_retries=6):
@@ -198,13 +282,40 @@ def sh_read(svc, sid, rng):
         spreadsheetId=sid, range=rng).execute().get("values", []))
 
 def sh_write(svc, sid, rng, vals):
+    if _DRY_RUN:
+        print(f"    [dry-run] would write to {rng}: {len(vals)} row(s)")
+        return
     _sheets_retry(lambda: svc.spreadsheets().values().update(
         spreadsheetId=sid, range=rng, valueInputOption="USER_ENTERED",
         body={"values": vals}).execute())
 
 def sh_clear(svc, sid, rng):
+    if _DRY_RUN:
+        print(f"    [dry-run] would clear {rng}")
+        return
     _sheets_retry(lambda: svc.spreadsheets().values().clear(
         spreadsheetId=sid, range=rng, body={}).execute())
+
+def sh_batch_write(svc, sid, updates, value_input_option="USER_ENTERED"):
+    """Write multiple (possibly scattered) ranges in a single API call.
+
+    updates: list of (range_str, values_2d) tuples. Empty list is a no-op.
+    Each update is independent — ranges can be discontinuous, in any order.
+
+    Wins: 1 HTTP round-trip instead of N, 1 quota slot instead of N, no
+    torn-state window between writes if a later one fails.
+    """
+    if not updates:
+        return
+    if _DRY_RUN:
+        print(f"    [dry-run] would batch-write {len(updates)} range(s)")
+        return
+    body = {
+        "valueInputOption": value_input_option,
+        "data": [{"range": r, "values": v} for r, v in updates],
+    }
+    return _sheets_retry(lambda: svc.spreadsheets().values().batchUpdate(
+        spreadsheetId=sid, body=body).execute())
 
 def ensure_tab(svc, sid, tab_name):
     """Create a tab if it doesn't exist."""
@@ -243,6 +354,9 @@ def _get_claim_data_api(slugs):
     project = env("LIGHTDASH_PROJECT_UUID")
 
     sql = build_slug_sql(slugs)
+    if sql is None:
+        print(f"    ⊘ No valid slugs to query Lightdash")
+        return []
     qid, err = ld_submit_sql(api_url, api_key, project, sql)
     if err:
         print(f"    ✘ Lightdash submit: {err}")
@@ -300,7 +414,11 @@ def xval(row, col):
 # ---------------------------------------------------------------------------
 # Asana helpers
 # ---------------------------------------------------------------------------
-def asana_req(method, path, pat, body=None):
+_ASANA_RETRYABLE_STATUSES = (429, 500, 502, 503)
+
+
+def _asana_req_once(method, path, pat, body=None):
+    """Single Asana API call, no retry. Returns (status, body)."""
     url = f"https://app.asana.com/api/1.0{path}"
     data = json.dumps({"data": body}).encode("utf-8") if body else None
     req = urllib.request.Request(url, data=data, method=method, headers={
@@ -313,6 +431,44 @@ def asana_req(method, path, pat, body=None):
         try: b = err.read().decode("utf-8", errors="replace")
         except: pass
         return err.code, b
+
+
+_ASANA_MUTATING_METHODS = ("POST", "PUT", "DELETE", "PATCH")
+
+
+def asana_req(method, path, pat, body=None, max_retries=6, bypass_dry_run=False):
+    """Asana API wrapper with exponential backoff on 429/500/502/503.
+
+    Returns (status, body). 4xx other than 429 (auth, validation, etc.)
+    are not retried — those need code/config fixes, not waiting.
+
+    In dry-run mode, mutating methods (POST/PUT/DELETE/PATCH) are skipped
+    and a fake-success response is returned. GETs still go through.
+
+    bypass_dry_run=True forces the call through even when dry-run is on.
+    Reserved for the run recorder posting to the central log Asana project,
+    which must succeed regardless of working-data mutation policy.
+    """
+    if _DRY_RUN and not bypass_dry_run and method in _ASANA_MUTATING_METHODS:
+        body_summary = str(body)[:120] if body else ""
+        print(f"    [dry-run] would {method} {path} body={body_summary}")
+        # Return the same status code the real API would (200 for PUT/PATCH/DELETE,
+        # 201 for POST) so dry-run doesn't trip closure checks like `s == 200`.
+        fake_status = 201 if method == "POST" else 200
+        return fake_status, {"data": {"gid": "dry-run", "name": "dry-run"}}
+
+    delay = 2
+    status, b = None, None
+    for attempt in range(max_retries):
+        status, b = _asana_req_once(method, path, pat, body)
+        if status in _ASANA_RETRYABLE_STATUSES and attempt < max_retries - 1:
+            print(f"    [Asana {status} — backing off {delay}s "
+                  f"(attempt {attempt + 1}/{max_retries})]")
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+            continue
+        return status, b
+    return status, b
 
 
 def parse_claim_slugs(text):
@@ -377,19 +533,22 @@ def get_new_tasks_needing_woip(pat, project_gid):
     Fetch tasks in New Tasks section where Have All Claims Returned = No.
     Returns list of dicts: {gid, name, claims_text, slugs, needs_review}
     """
-    tasks = asana_get_section_tasks(pat, project_gid, ASANA_SECTION_NEW)
+    tasks = asana_get_section_tasks(pat, project_gid, env("ASANA_SECTION_NEW"))
     result = []
+    field_all_returned = env("ASANA_FIELD_ALL_RETURNED")
+    field_claims_text = env("ASANA_FIELD_CLAIMS_TEXT")
+    opt_returned_no = env("ASANA_OPT_RETURNED_NO")
     for t in tasks:
         # Check "Have All Claims Returned" field
-        ret_field = asana_task_field(t, ASANA_FIELD_ALL_RETURNED)
+        ret_field = asana_task_field(t, field_all_returned)
         if not ret_field:
             continue
         ev = ret_field.get("enum_value")
-        if not ev or ev.get("gid") != ASANA_OPT_RETURNED_NO:
+        if not ev or ev.get("gid") != opt_returned_no:
             continue
 
         # Get claims text
-        claims_field = asana_task_field(t, ASANA_FIELD_CLAIMS_TEXT)
+        claims_field = asana_task_field(t, field_claims_text)
         claims_text = (claims_field.get("text_value") or "") if claims_field else ""
         slugs, needs_review = parse_claim_slugs(claims_text)
 
@@ -427,23 +586,29 @@ def check_all_claims_returned(task_gid, svc, sid):
 def append_claims_to_sheet(task, svc, sid):
     """
     Append one row per parsed slug to Sheet1 for a new Asana task.
-    Skips slugs that already exist in column E.
-    Returns count of rows appended.
-    """
-    existing_rows = sh_read(svc, sid, "Sheet1!E:E")
-    existing_slugs = set()
-    for r in existing_rows[DATA_START_ROW - 1:]:
-        if r:
-            existing_slugs.add(r[0].strip().lower())
+    Idempotent on (slug, task_gid) — skips slugs already attached to this task,
+    but allows the same slug under a different task. Matches asana_monitor's
+    dedup semantics so test_10's Step 0 re-seed no longer creates duplicates.
 
-    task_url = f"https://app.asana.com/0/{env('ASANA_PROJECT_GID', required=False)}/{task['gid']}"
-    today_str = date.today().strftime("%m/%d/%Y")
-    appended = 0
+    Returns count of rows appended. One API call regardless of slug count.
+    """
+    existing_rows = sh_read(svc, sid, "Sheet1!A:Z")
+    existing_pairs = set()
+    for r in existing_rows[DATA_START_ROW - 1:]:
+        slug_cell = r[4].strip().lower() if len(r) > 4 else ""
+        gid_cell = r[COL_Z_INDEX].lstrip("'").strip() if len(r) > COL_Z_INDEX else ""
+        if slug_cell and gid_cell:
+            existing_pairs.add((slug_cell, gid_cell))
+
+    task_gid = str(task["gid"]).strip()
+    task_url = f"https://app.asana.com/0/{env('ASANA_PROJECT_GID', required=False)}/{task_gid}"
+    today_str = utc_today().strftime("%m/%d/%Y")
+    new_rows = []
 
     for slug in task["slugs"]:
-        if slug.lower() in existing_slugs:
+        key = (slug.lower(), task_gid)
+        if key in existing_pairs:
             continue
-        # Build row: A through Z (pad empty cols L-Y, Z = task GID)
         row = [
             f"cl-{slug}",         # A: Claim Slug
             "",                    # B: Associate
@@ -459,20 +624,23 @@ def append_claims_to_sheet(task, svc, sid):
             "",                    # L: PI Inquiry Status
             "",                    # M: Ticket #
         ]
-        # Pad columns N-Y (indices 13-24) then Z (index 25)
-        row += [""] * 12 + [task["gid"]]
+        # Pad columns N-Y (indices 13-24) then Z (index 25).
+        # Leading apostrophe forces text storage — without it, 16-digit GIDs
+        # get coerced to scientific notation, which breaks idempotency.
+        row += [""] * 12 + [f"'{task_gid}"]
+        new_rows.append(row)
+        existing_pairs.add(key)
 
-        svc.spreadsheets().values().append(
+    if new_rows:
+        _sheets_retry(lambda: svc.spreadsheets().values().append(
             spreadsheetId=sid,
             range="Sheet1!A1",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
-            body={"values": [row]}
-        ).execute()
-        existing_slugs.add(slug.lower())
-        appended += 1
+            body={"values": new_rows},
+        ).execute())
 
-    return appended
+    return len(new_rows)
 
 
 # ---------------------------------------------------------------------------
@@ -486,24 +654,198 @@ def is_actionable(status, adj_day):
     return False
 
 def days_since_submission(submitted_str):
-    """Days between submission date and today. Negative = past."""
+    """Days elapsed since submission. Positive for past dates, None on bad input."""
     if not submitted_str: return None
     try:
-        sub = datetime.fromisoformat(submitted_str.replace("Z", "+00:00")).date()
-        return (sub - date.today()).days
+        sub = datetime.fromisoformat(submitted_str.replace("Z", "+00:00")).astimezone(timezone.utc).date()
+        return (utc_today() - sub).days
     except: return None
 
 def calc_aging(days):
-    """Mirrors: =IF(days > -1000, IF(days < -90, "Aging", FALSE), FALSE)"""
+    """'Aging' once submission is older than the threshold; otherwise 'FALSE'."""
     if days is None: return ""
-    return "Aging" if (days > -1000 and days < -AGING_THRESHOLD_DAYS) else "FALSE"
+    return "Aging" if days > AGING_THRESHOLD_DAYS else "FALSE"
+
+def close_completed_tasks(svc, sid, pat, all_rows, log=print):
+    """For each unique task GID in the sheet whose claims have all returned
+    (every row with that GID in col Z has Return Check = TRUE), update the
+    Asana task: Have All Claims Returned → Yes, CX/OPs → needs follow-up,
+    post a confirmation comment. Idempotent — tasks already marked Yes are
+    skipped so this is safe to re-run.
+
+    Returns counters dict. Honors the global dry-run flag through asana_req.
+    """
+    field_all_returned = env("ASANA_FIELD_ALL_RETURNED")
+    opt_returned_yes = env("ASANA_OPT_RETURNED_YES")
+    field_cx_ops = env("ASANA_FIELD_CX_OPS")
+    opt_needs_followup = env("ASANA_OPT_NEEDS_FOLLOWUP")
+
+    task_gids = set()
+    for row in all_rows[DATA_START_ROW - 1:]:
+        if len(row) > COL_Z_INDEX:
+            gid = row[COL_Z_INDEX].lstrip("'").strip()
+            if gid:
+                task_gids.add(gid)
+
+    counters = {
+        "close_tasks_seen": len(task_gids),
+        "close_tasks_closed": 0,
+        "close_tasks_partial": 0,
+        "close_tasks_already_yes": 0,
+        "close_tasks_failed": 0,
+    }
+    ts_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    for task_gid in sorted(task_gids):
+        all_ret, total, returned = check_all_claims_returned(task_gid, svc, sid)
+        if not all_ret or total == 0:
+            counters["close_tasks_partial"] += 1
+            continue
+
+        s, body = asana_req(
+            "GET",
+            f"/tasks/{task_gid}?opt_fields=custom_fields.gid,custom_fields.enum_value.gid",
+            pat,
+        )
+        if s != 200:
+            log(f"    Task {task_gid}: fetch failed ({s})")
+            counters["close_tasks_failed"] += 1
+            continue
+
+        ret_field = asana_task_field(body.get("data", {}), field_all_returned)
+        ev = (ret_field or {}).get("enum_value") or {}
+        if ev.get("gid") == opt_returned_yes:
+            counters["close_tasks_already_yes"] += 1
+            continue
+
+        s1, _ = asana_update_field(pat, task_gid, field_all_returned, opt_returned_yes)
+        s2, _ = asana_update_field(pat, task_gid, field_cx_ops, opt_needs_followup)
+        s3, _ = asana_post_comment(
+            pat, task_gid,
+            f"[Automation] All {total} claim(s) have returned as of {ts_now}. "
+            f"Task updated to 'needs follow-up'.",
+        )
+
+        if s1 == 200 and s2 == 200:
+            counters["close_tasks_closed"] += 1
+            log(f"    ✔ Task {task_gid} closed ({total} claims) "
+                f"comment={'OK' if s3 in (200, 201) else f'FAILED ({s3})'}")
+        else:
+            counters["close_tasks_failed"] += 1
+            log(f"    ✘ Task {task_gid} close failed (s1={s1} s2={s2})")
+
+    return counters
+
+
+def check_stale_claims(svc, sid, pat, pending, by_slug, all_rows, log=print):
+    """Track first-no-data date in col N, post stale-claim Asana comment after
+    STALE_DAYS_THRESHOLD days, and mark col O so we don't re-notify.
+
+    Logic per pending slug:
+      - If has Lightdash data → skip (not stale).
+      - Else if col N empty → write today's date to col N.
+      - Else if col O is set → already notified, skip.
+      - Else if (today - col N) >= 30 days → post Asana comment, write today to col O.
+      - Else → still inside grace window, no action.
+
+    All sheet writes are batched into one sh_batch_write call. Returns counters dict.
+    """
+    today = utc_today()
+    today_iso = today.isoformat()
+    counters = {
+        "stale_first_seen_stamped": 0,
+        "stale_comments_posted": 0,
+        "stale_already_notified": 0,
+        "stale_inside_grace": 0,
+    }
+    sheet_updates = []
+
+    for slug, idx in pending.items():
+        if by_slug.get(slug):
+            continue  # has data → not stale
+
+        row = all_rows[idx - 1] if 0 < idx <= len(all_rows) else []
+        first_seen_str = row[COL_N_INDEX].strip() if len(row) > COL_N_INDEX else ""
+        notified_str = row[COL_O_INDEX].strip() if len(row) > COL_O_INDEX else ""
+
+        if not first_seen_str:
+            sheet_updates.append((f"Sheet1!N{idx}", [[today_iso]]))
+            counters["stale_first_seen_stamped"] += 1
+            log(f"    Row {idx} ({slug}): no data — stamping first-seen-empty")
+            continue
+
+        if notified_str:
+            counters["stale_already_notified"] += 1
+            continue
+
+        try:
+            first_seen = date.fromisoformat(first_seen_str)
+        except (ValueError, TypeError):
+            log(f"    Row {idx} ({slug}): malformed col N {first_seen_str!r} — skipping")
+            continue
+
+        days_stale = (today - first_seen).days
+        if days_stale < STALE_DAYS_THRESHOLD:
+            counters["stale_inside_grace"] += 1
+            continue
+
+        task_gid = (row[COL_Z_INDEX].lstrip("'").strip()
+                    if len(row) > COL_Z_INDEX else "")
+        if not task_gid or not pat:
+            log(f"    Row {idx} ({slug}): missing task_gid or pat — can't notify")
+            continue
+
+        text = (
+            f"[Automation] Claim `{slug}` has no data in Lightdash after "
+            f"{days_stale} days. Likely typo or stale ID — please verify "
+            f"and re-enter or remove from the task."
+        )
+        s, _ = asana_post_comment(pat, task_gid, text)
+        if s in (200, 201):
+            sheet_updates.append((f"Sheet1!O{idx}", [[today_iso]]))
+            counters["stale_comments_posted"] += 1
+            log(f"    Row {idx} ({slug}): stale comment posted to {task_gid} ({days_stale}d)")
+        else:
+            log(f"    Row {idx} ({slug}): comment post failed (status {s}) — will retry next sweep")
+
+    sh_batch_write(svc, sid, sheet_updates)
+    return counters
+
+
+def write_fk_batched(svc, sid, pending, by_slug, log=print):
+    """Compute F-K for each pending slug and write them all in a single batch call.
+
+    pending: {slug: row_idx}
+    by_slug: {slug: [ld_rows]}
+    log:     status callback (print by default).
+
+    Returns (matched, no_data) counts. One sh_batch_write call regardless of N.
+    """
+    matched = 0
+    no_data = 0
+    batch = []
+    for slug, idx in pending.items():
+        rows = by_slug.get(slug, [])
+        if not rows:
+            no_data += 1
+            log(f"    Row {idx} ({slug}): no data — skip")
+            continue
+        matched += 1
+        res = process_claim(slug, rows)
+        vals = [res["return_check"], str(res["row_count"]), str(res["true_count"]),
+                res["work_ticket"], str(res["aging_status"]), res["send_to_aging"]]
+        log(f"    Row {idx} ({slug}): {vals}")
+        batch.append((f"Sheet1!F{idx}:K{idx}", [vals]))
+    sh_batch_write(svc, sid, batch)
+    return matched, no_data
+
 
 def process_claim(slug, ld_rows):
     """Calculate columns F-K for a single claim slug."""
     row_count = len(ld_rows)
     true_count = 0
     any_returned = False
-    min_days = None
+    oldest_days = None  # max days since submission across all rows
 
     for row in ld_rows:
         status = xval(row, LD_STATUS)
@@ -515,16 +857,16 @@ def process_claim(slug, ld_rows):
             any_returned = True
 
         d = days_since_submission(submitted)
-        if d is not None and (min_days is None or d < min_days):
-            min_days = d
+        if d is not None and (oldest_days is None or d > oldest_days):
+            oldest_days = d
 
-    aging = calc_aging(min_days)
+    aging = calc_aging(oldest_days)
     return {
         "return_check": "TRUE" if any_returned else "FALSE",
         "row_count": row_count,
         "true_count": true_count,
         "work_ticket": "WORK" if true_count > 0 else "",
-        "aging_status": str(min_days) if min_days is not None else "",
+        "aging_status": str(oldest_days) if oldest_days is not None else "",
         "send_to_aging": "TRUE" if aging == "Aging" else "FALSE",
     }
 
@@ -563,7 +905,7 @@ def build_seed_data():
     Build test scenarios for the LightdashData tab.
     Returns (headers, rows) where each row tests a different code path.
     """
-    today = date.today()
+    today = utc_today()
     headers = LD_COLUMNS
 
     rows = [
@@ -650,12 +992,14 @@ def build_seed_data():
 
 
 def build_tracking_seed(test_slug=None):
-    """Build seed rows for Sheet1 tracking tab, referencing LightdashData slugs."""
-    row1 = ["", "Associate To Enter", "", "", "", "Joey ONLY", "", "", "", "", "", "", ""]
+    """Build seed rows for Sheet1 tracking tab, referencing LightdashData slugs.
+    Header row width = 15 (A-O). Data rows match. N/O columns track stale claims."""
+    row1 = ["", "Associate To Enter", "", "", "", "Joey ONLY", "", "", "", "", "", "", "", "", ""]
     row2 = ["Claim Slug", "Associate", "Date added", "Asana task",
             "clean claim slug", "Return Check", "Ticket row count",
             "Ticket TRUE count", "Work ticket?", "Aging Status",
-            "Send to Aging?", "PI Inquiry Status", "Ticket #"]
+            "Send to Aging?", "PI Inquiry Status", "Ticket #",
+            "First No Data Date", "Stale Notified"]
 
     # Use real test slug if provided, plus simulated slugs matching LightdashData
     slugs_to_seed = [
@@ -687,6 +1031,8 @@ def build_tracking_seed(test_slug=None):
             "FALSE" if is_done else "",                 # K
             "",                                         # L: PI Inquiry Status
             "",                                         # M: Ticket #
+            "",                                         # N: First No Data Date
+            "",                                         # O: Stale Notified
         ])
 
     return [row1, row2] + data_rows
@@ -805,10 +1151,10 @@ def test_5_sheets_setup():
 
         # --- Sheet1: tracking tab ---
         print("  --- Sheet1 (tracking) ---")
-        sh_clear(svc, sid, "Sheet1!A:M")
+        sh_clear(svc, sid, "Sheet1!A:O")
         tracking_data = build_tracking_seed(test_slug)
         row_count = len(tracking_data)
-        sh_write(svc, sid, f"Sheet1!A1:M{row_count}", tracking_data)
+        sh_write(svc, sid, f"Sheet1!A1:O{row_count}", tracking_data)
         print(f"  Wrote {row_count} rows (2 header + {row_count - 2} data)")
 
         for i, r in enumerate(tracking_data[:5]):
@@ -992,7 +1338,7 @@ def test_9_asana_intake():
 
         # Step 2: Set CX/OPs to WOIP
         print(f"    → Setting CX/OPs to 'waiting on insurance partner'")
-        s, b = asana_update_field(pat, t["gid"], ASANA_FIELD_CX_OPS, ASANA_OPT_WOIP)
+        s, b = asana_update_field(pat, t["gid"], env("ASANA_FIELD_CX_OPS"), env("ASANA_OPT_WOIP"))
         print(f"    → Update: {'OK' if s == 200 else f'FAILED ({s})'}")
         if s != 200:
             print(f"    → Response: {str(b)[:200]}")
@@ -1012,7 +1358,7 @@ def test_9_asana_intake():
             continue
         s, b = asana_req("GET", f"/tasks/{t['gid']}?opt_fields=custom_fields.gid,custom_fields.display_value", pat)
         if s == 200:
-            cx_field = asana_task_field(b.get("data", {}), ASANA_FIELD_CX_OPS)
+            cx_field = asana_task_field(b.get("data", {}), env("ASANA_FIELD_CX_OPS"))
             val = cx_field.get("display_value", "?") if cx_field else "?"
             print(f"  Task {t['gid']}: CX/OPs = {val}")
 
@@ -1039,10 +1385,10 @@ def test_10_asana_return_update():
 
     # Step 0: Seed WOIP task claims into the sheet so we can test the aggregation
     print(f"  --- Step 0: Seed WOIP task claims into sheet ---")
-    woip_tasks = asana_get_section_tasks(pat, proj, ASANA_SECTION_WOIP)
+    woip_tasks = asana_get_section_tasks(pat, proj, env("ASANA_SECTION_WOIP"))
     seeded = 0
     for t in woip_tasks:
-        claims_field = asana_task_field(t, ASANA_FIELD_CLAIMS_TEXT)
+        claims_field = asana_task_field(t, env("ASANA_FIELD_CLAIMS_TEXT"))
         claims_text = (claims_field.get("text_value") or "") if claims_field else ""
         slugs, needs_review = parse_claim_slugs(claims_text)
         if not slugs:
@@ -1071,27 +1417,20 @@ def test_10_asana_return_update():
                 s = xval(row, LD_SLUG)
                 if s:
                     by_slug.setdefault(s, []).append(row)
-
-        for slug, idx in pending.items():
-            rows = by_slug.get(slug, [])
-            if not rows:
-                continue
-            res = process_claim(slug, rows)
-            vals = [res["return_check"], str(res["row_count"]), str(res["true_count"]),
-                    res["work_ticket"], str(res["aging_status"]), res["send_to_aging"]]
-            sh_write(svc, sid, f"Sheet1!F{idx}:K{idx}", [vals])
-            print(f"    Row {idx} ({slug}): F-K = {vals}")
+        write_fk_batched(svc, sid, pending, by_slug)
 
     # Step 1: Get tasks in WOIP section with Have All Claims Returned = No
     print(f"\n  --- Step 1: Find WOIP tasks with pending returns ---")
-    tasks = asana_get_section_tasks(pat, proj, ASANA_SECTION_WOIP)
+    tasks = asana_get_section_tasks(pat, proj, env("ASANA_SECTION_WOIP"))
     pending_tasks = []
+    field_all_returned = env("ASANA_FIELD_ALL_RETURNED")
+    opt_returned_no = env("ASANA_OPT_RETURNED_NO")
     for t in tasks:
-        ret_field = asana_task_field(t, ASANA_FIELD_ALL_RETURNED)
+        ret_field = asana_task_field(t, field_all_returned)
         if not ret_field:
             continue
         ev = ret_field.get("enum_value")
-        if ev and ev.get("gid") == ASANA_OPT_RETURNED_NO:
+        if ev and ev.get("gid") == opt_returned_no:
             pending_tasks.append(t)
 
     print(f"  Found {len(pending_tasks)} WOIP task(s) with claims not returned")
@@ -1115,10 +1454,10 @@ def test_10_asana_return_update():
         # Step 3: Update Asana — both fields
         print(f"    -> All claims returned! Updating Asana...")
 
-        s1, _ = asana_update_field(pat, task_gid, ASANA_FIELD_ALL_RETURNED, ASANA_OPT_RETURNED_YES)
+        s1, _ = asana_update_field(pat, task_gid, env("ASANA_FIELD_ALL_RETURNED"), env("ASANA_OPT_RETURNED_YES"))
         print(f"    -> Have All Claims Returned = Yes: {'OK' if s1 == 200 else f'FAILED ({s1})'}")
 
-        s2, _ = asana_update_field(pat, task_gid, ASANA_FIELD_CX_OPS, ASANA_OPT_NEEDS_FOLLOWUP)
+        s2, _ = asana_update_field(pat, task_gid, env("ASANA_FIELD_CX_OPS"), env("ASANA_OPT_NEEDS_FOLLOWUP"))
         print(f"    -> CX/OPs = needs follow-up: {'OK' if s2 == 200 else f'FAILED ({s2})'}")
 
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -1143,11 +1482,11 @@ def test_11_e2e():
     source = "Lightdash API" if has_lightdash() else "LightdashData tab"
     print(f"  Data source: {source}")
 
-    # Step 1: Read pending slugs
+    # Step 1: Read pending slugs (read A:Z so we have col N/O for stale-check + col Z for task GID)
     print(f"\n  --- Step 1: Read pending ---")
     try:
         svc = get_sheets_service()
-        all_rows = sh_read(svc, sid, "Sheet1!A:M")
+        all_rows = sh_read(svc, sid, "Sheet1!A:Z")
     except Exception as e:
         print(f"  ✘ {e}"); return False
 
@@ -1178,39 +1517,41 @@ def test_11_e2e():
 
     print(f"  Unique slugs with data: {len(by_slug)}")
 
-    # Step 3-4: Process + Write
+    # Step 3-4: Process + Write F-K (one batched call for all pending rows)
     print(f"\n  --- Step 3-4: Process + Write F-K ---")
-    matched = 0
-    no_data = 0
+    try:
+        matched, no_data = write_fk_batched(svc, sid, pending, by_slug)
+    except Exception as e:
+        print(f"      ✘ Batch write failed: {e}")
+        matched, no_data = 0, len(pending)
 
-    for slug, idx in pending.items():
-        rows = by_slug.get(slug, [])
-        if not rows:
-            no_data += 1
-            print(f"    Row {idx} ({slug}): no data — skip")
-            continue
+    # Step 4b: Stale-claim check — track no-data slugs, notify after 30 days
+    if no_data > 0:
+        print(f"\n  --- Step 4b: Stale-claim check ({no_data} slug(s) without Lightdash data) ---")
+        pat = env("ASANA_PAT", required=False)
+        if pat:
+            try:
+                stale_counters = check_stale_claims(svc, sid, pat, pending, by_slug, all_rows)
+                print(f"  Stale: {stale_counters}")
+            except Exception as e:
+                print(f"  ✘ Stale check failed: {e}")
+        else:
+            print(f"  ⊘ Skipping stale check — ASANA_PAT not set")
 
-        matched += 1
-        res = process_claim(slug, rows)
-        vals = [res["return_check"], str(res["row_count"]), str(res["true_count"]),
-                res["work_ticket"], str(res["aging_status"]), res["send_to_aging"]]
-
-        print(f"    Row {idx} ({slug}): {vals}")
+    # Step 5: Close Asana tasks whose claims are all returned (real writes;
+    # honors --dry-run via the global flag).
+    print(f"\n  --- Step 5: Close completed Asana tasks ---")
+    pat = env("ASANA_PAT", required=False)
+    if pat:
+        # Re-read after Step 3-4 wrote F-K — close logic needs current state.
+        all_rows_after = sh_read(svc, sid, "Sheet1!A:Z")
         try:
-            sh_write(svc, sid, f"Sheet1!F{idx}:K{idx}", [vals])
+            close_counters = close_completed_tasks(svc, sid, pat, all_rows_after)
+            print(f"  Close: {close_counters}")
         except Exception as e:
-            print(f"      ✘ Write failed: {e}")
-
-    # Step 5: Asana report
-    print(f"\n  --- Step 5: Asana (report only) ---")
-    for slug, idx in pending.items():
-        if slug not in by_slug: continue
-        row = all_rows[idx-1] if idx <= len(all_rows) else []
-        link = row[3].strip() if len(row) > 3 else ""
-        print(f"    {slug} → {link or '(no Asana link)'}")
-        if link:
-            print(f"      → Would update custom field")
-            print(f"      → Would post parent task comment")
+            print(f"  ✘ Close pass failed: {e}")
+    else:
+        print(f"  ⊘ Skipping close pass — ASANA_PAT not set")
 
     # Verify
     print(f"\n  --- Verify writes ---")
@@ -1237,7 +1578,6 @@ TEST_MAP = {
     ],
     "sheets": [
         ("Test 4: Sheets Auth", test_4_sheets_auth),
-        ("Test 5: Setup+Seed", test_5_sheets_setup),
         ("Test 6: Read Pending", test_6_read_pending),
         ("Test 7: Write F-K", test_7_write_columns),
     ],
@@ -1249,15 +1589,41 @@ TEST_MAP = {
     "e2e": [
         ("Test 11: E2E Pipeline", test_11_e2e),
     ],
+    # DESTRUCTIVE — wipes Sheet1!A:M and LightdashData!A:G then re-seeds.
+    # Excluded from "all" so it never runs incidentally. Invoke only when
+    # you explicitly want to reset the sheet to a fresh bootstrap state.
+    "setup": [
+        ("Test 5: Setup+Seed (DESTRUCTIVE)", test_5_sheets_setup),
+    ],
 }
 
+ALL_GROUPS = ["lightdash", "sheets", "asana", "e2e"]   # "setup" excluded — destructive
+
 def run_tests(group="all"):
+    from claims_logging import setup_logging, gen_run_id, set_run_id
+    from recorder import RunRecorder
+
+    setup_logging()
     load_env()
+    verify_lightdash()  # fail loud on misconfigured URL/key (no-op if unset)
+
+    run_id = gen_run_id()
+    set_run_id(run_id)
+    pat = os.getenv("ASANA_PAT", "")
+    recorder_gid = os.getenv("ASANA_RECORDER_TASK_GID", "")
+    recorder = RunRecorder(pat, run_id, f"test_group_{group}", task_gid=recorder_gid)
+
     results = {}
-    for g in (TEST_MAP.keys() if group == "all" else [group]):
-        for name, fn in TEST_MAP.get(g, []):
-            r = fn()
-            results[name] = r[0] if isinstance(r, tuple) else r
+    groups = ALL_GROUPS if group == "all" else [group]
+    try:
+        for g in groups:
+            for name, fn in TEST_MAP.get(g, []):
+                r = fn()
+                results[name] = r[0] if isinstance(r, tuple) else r
+    except Exception as e:
+        recorder.error(repr(e))
+        recorder.flush(status="error")
+        raise
 
     print(); print("=" * 60); print("SUMMARY"); print("=" * 60)
     for n, p in results.items():
@@ -1267,12 +1633,22 @@ def run_tests(group="all"):
     skipped = sum(1 for v in results.values() if v is None)
     failed = sum(1 for v in results.values() if v is False)
     print(f"\n  Passed: {passed}  Skipped: {skipped}  Failed: {failed}")
+
+    recorder.record(passed=passed, skipped=skipped, failed=failed,
+                    tests_run=len(results), group=group)
+    recorder.flush(status="success" if failed == 0 else "error")
     return failed == 0
 
 def main():
-    g = sys.argv[1] if len(sys.argv) > 1 else "all"
-    if g not in ("all", "lightdash", "sheets", "asana", "e2e"):
-        print("Usage: python3 test_suite.py [all|lightdash|sheets|asana|e2e]")
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    flags = [a for a in sys.argv[1:] if a.startswith("-")]
+    if "--dry-run" in flags:
+        set_dry_run(True)
+        print("[dry-run] mode enabled — no Sheets/Asana mutations will be executed")
+    g = args[0] if args else "all"
+    valid = ("all",) + tuple(ALL_GROUPS) + ("setup",)
+    if g not in valid:
+        print(f"Usage: python3 test_suite.py [{' | '.join(valid)}] [--dry-run]")
         sys.exit(1)
     sys.exit(0 if run_tests(g) else 1)
 

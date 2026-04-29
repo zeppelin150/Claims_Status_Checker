@@ -1,6 +1,9 @@
 name: Pipeline Test Suite
 
 on:
+  # Production cron — runs the real ETL on a schedule.
+  schedule:
+    - cron: '0 13 * * *'  # 13:00 UTC daily; adjust as needed
   workflow_dispatch:
     inputs:
       test_group:
@@ -14,6 +17,7 @@ on:
           - sheets
           - asana
           - e2e
+          - setup    # DESTRUCTIVE — wipes Sheet1 + LightdashData and re-seeds. Run only intentionally.
 
 jobs:
   test:
@@ -27,16 +31,59 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - name: Run tests
+      - name: Run unit + regression tests
+        run: python3 -m pytest tests/ -v
+
+      - name: Run production ETL (cron only)
+        if: github.event_name == 'schedule'
+        env:
+          IS_CI: 'true'
+          WRITE_ONE_ROW: 'false'
+          LIGHTDASH_API_URL:           ${{ secrets.LIGHTDASH_API_URL }}
+          LIGHTDASH_API_KEY:           ${{ secrets.LIGHTDASH_API_KEY }}
+          LIGHTDASH_PROJECT_UUID:      ${{ secrets.LIGHTDASH_PROJECT_UUID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEETS_SPREADSHEET_ID: ${{ secrets.GOOGLE_SHEETS_SPREADSHEET_ID }}
+          ASANA_PAT:                   ${{ secrets.ASANA_PAT }}
+          ASANA_PROJECT_GID:           ${{ secrets.ASANA_PROJECT_GID }}
+          ASANA_SECTION_NEW:           ${{ secrets.ASANA_SECTION_NEW }}
+          ASANA_SECTION_WOIP:          ${{ secrets.ASANA_SECTION_WOIP }}
+          ASANA_FIELD_CX_OPS:          ${{ secrets.ASANA_FIELD_CX_OPS }}
+          ASANA_FIELD_CLAIMS_TEXT:     ${{ secrets.ASANA_FIELD_CLAIMS_TEXT }}
+          ASANA_FIELD_ALL_RETURNED:    ${{ secrets.ASANA_FIELD_ALL_RETURNED }}
+          ASANA_OPT_WOIP:              ${{ secrets.ASANA_OPT_WOIP }}
+          ASANA_OPT_NEEDS_FOLLOWUP:    ${{ secrets.ASANA_OPT_NEEDS_FOLLOWUP }}
+          ASANA_OPT_RETURNED_YES:      ${{ secrets.ASANA_OPT_RETURNED_YES }}
+          ASANA_OPT_RETURNED_NO:       ${{ secrets.ASANA_OPT_RETURNED_NO }}
+          ASANA_LOG_PROJECT_GID:       ${{ secrets.ASANA_LOG_PROJECT_GID }}
+          CXOPS_NORMAL_CLAIMS_ETL_LOG_SECTION_GID: ${{ secrets.CXOPS_NORMAL_CLAIMS_ETL_LOG_SECTION_GID }}
+        run: python3 CXOps_BPA_Normal_Claims_Status_ETL.py
+
+      - name: Run integration tests
         env:
           LIGHTDASH_API_URL:           ${{ secrets.LIGHTDASH_API_URL }}
           LIGHTDASH_API_KEY:           ${{ secrets.LIGHTDASH_API_KEY }}
           LIGHTDASH_CHART_UUID:        ${{ secrets.LIGHTDASH_CHART_UUID }}
           LIGHTDASH_PROJECT_UUID:      ${{ secrets.LIGHTDASH_PROJECT_UUID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          # GOOGLE_SERVICE_ACCOUNT_FILE intentionally unset in CI — JSON is the CI path.
           GOOGLE_SHEETS_SPREADSHEET_ID: ${{ secrets.GOOGLE_SHEETS_SPREADSHEET_ID }}
           TEST_CLAIM_SLUG:             ${{ secrets.TEST_CLAIM_SLUG }}
           ASANA_PAT:                   ${{ secrets.ASANA_PAT }}
           ASANA_PROJECT_GID:           ${{ secrets.ASANA_PROJECT_GID }}
           ASANA_TEST_TASK_GID:         ${{ secrets.ASANA_TEST_TASK_GID }}
+          # Asana GIDs (one-time discovery values; rotate by re-discovering)
+          ASANA_SECTION_NEW:           ${{ secrets.ASANA_SECTION_NEW }}
+          ASANA_SECTION_WOIP:          ${{ secrets.ASANA_SECTION_WOIP }}
+          ASANA_FIELD_CX_OPS:          ${{ secrets.ASANA_FIELD_CX_OPS }}
+          ASANA_FIELD_CLAIMS_TEXT:     ${{ secrets.ASANA_FIELD_CLAIMS_TEXT }}
+          ASANA_FIELD_ALL_RETURNED:    ${{ secrets.ASANA_FIELD_ALL_RETURNED }}
+          ASANA_OPT_WOIP:              ${{ secrets.ASANA_OPT_WOIP }}
+          ASANA_OPT_NEEDS_FOLLOWUP:    ${{ secrets.ASANA_OPT_NEEDS_FOLLOWUP }}
+          ASANA_OPT_RETURNED_YES:      ${{ secrets.ASANA_OPT_RETURNED_YES }}
+          ASANA_OPT_RETURNED_NO:       ${{ secrets.ASANA_OPT_RETURNED_NO }}
+          ASANA_RECORDER_TASK_GID:     ${{ secrets.ASANA_RECORDER_TASK_GID }}
+          # Central log project (production ETL run records)
+          ASANA_LOG_PROJECT_GID:       ${{ secrets.ASANA_LOG_PROJECT_GID }}
+          CXOPS_NORMAL_CLAIMS_ETL_LOG_SECTION_GID: ${{ secrets.CXOPS_NORMAL_CLAIMS_ETL_LOG_SECTION_GID }}
         run: python3 test_suite.py ${{ github.event.inputs.test_group || 'all' }}

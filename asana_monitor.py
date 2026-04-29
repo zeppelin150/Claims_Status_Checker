@@ -21,6 +21,7 @@ Usage:
 """
 
 import argparse
+import logging
 import signal
 import sys
 import time
@@ -35,12 +36,15 @@ except Exception:
 
 sys.path.insert(0, str(Path(__file__).absolute().parent))
 from test_suite import (  # noqa: E402
-    load_env, env,
+    load_env, env, utc_today, verify_lightdash, set_dry_run,
     asana_req, asana_get_section_tasks, asana_task_field, asana_post_comment,
     parse_claim_slugs, get_sheets_service, sh_read,
-    ASANA_SECTION_WOIP, ASANA_FIELD_CLAIMS_TEXT,
     DATA_START_ROW, COL_Z_INDEX,
 )
+from claims_logging import setup_logging, gen_run_id, set_run_id  # noqa: E402
+from recorder import RunRecorder  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 REVIEW_MARKER = "[Automation]"  # marker to detect prior review comments
 
@@ -60,29 +64,39 @@ def read_existing_pairs(svc, sid):
     return pairs
 
 
-def append_row(svc, sid, task_gid, task_url, slug, today_str):
-    """Append one Sheet1 row for (task, slug). Columns A-K + Z.
-    Note: task_gid is prefixed with apostrophe to force Sheets to store as text.
-    16-digit GIDs otherwise get silently converted to scientific notation
-    ("1.21411E+15") and lose precision, which breaks idempotency in later sweeps.
+def append_rows(svc, sid, task_gid, task_url, slugs, today_str):
+    """Append one Sheet1 row per slug for a single (task, slugs) pair.
+    One API call regardless of slug count.
+
+    Note: task_gid is prefixed with apostrophe to force text storage. 16-digit
+    GIDs otherwise get coerced to scientific notation ("1.21411E+15") and lose
+    precision, breaking idempotency in later sweeps.
     """
-    row = [
-        f"cl-{slug}",     # A
-        "",               # B Associate
-        today_str,        # C Date added
-        task_url,         # D Asana task URL
-        slug,             # E Clean slug
-        "", "", "", "", "", "",  # F-K (pipeline populates)
-        "", "",           # L, M (PI / Ticket)
-    ]
-    row += [""] * 12 + [f"'{task_gid}"]  # pad to Z; leading ' forces text
+    if not slugs:
+        return
+    rows = []
+    for slug in slugs:
+        row = [
+            f"cl-{slug}",     # A
+            "",               # B Associate
+            today_str,        # C Date added
+            task_url,         # D Asana task URL
+            slug,             # E Clean slug
+            "", "", "", "", "", "",  # F-K (pipeline populates)
+            "", "",           # L, M (PI / Ticket)
+        ]
+        row += [""] * 12 + [f"'{task_gid}"]
+        rows.append(row)
     svc.spreadsheets().values().append(
         spreadsheetId=sid,
         range="Sheet1!A1",
         valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
-        body={"values": [row]},
+        body={"values": rows},
     ).execute()
+
+
+# Backwards-compat alias removed deliberately: callers must batch via append_rows.
 
 
 def task_has_review_comment(pat, task_gid):
@@ -99,18 +113,20 @@ def task_has_review_comment(pat, task_gid):
 # ═══════════════════════════════════════════════════════════════════════════════
 # SWEEP
 # ═══════════════════════════════════════════════════════════════════════════════
-def sweep(pat, project_gid, svc, sid, dry_run=False):
-    """One pass over the WOIP section. Returns dict of counters."""
+def sweep(pat, project_gid, svc, sid, dry_run=False, recorder=None):
+    """One pass over the WOIP section. Returns dict of counters.
+    If `recorder` is provided, counters/errors are recorded to it (caller
+    is responsible for flushing)."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
     print(f"\n[{ts}] WOIP sweep  dry_run={dry_run}")
 
-    tasks = asana_get_section_tasks(pat, project_gid, ASANA_SECTION_WOIP)
+    tasks = asana_get_section_tasks(pat, project_gid, env("ASANA_SECTION_WOIP"))
     print(f"  WOIP tasks: {len(tasks)}")
 
     existing = read_existing_pairs(svc, sid)
     print(f"  Sheet1 existing (slug, task) pairs: {len(existing)}")
 
-    today_str = date.today().strftime("%m/%d/%Y")
+    today_str = utc_today().strftime("%m/%d/%Y")
     counters = {
         "tasks_seen": len(tasks),
         "tasks_new": 0,
@@ -124,7 +140,7 @@ def sweep(pat, project_gid, svc, sid, dry_run=False):
     for t in tasks:
         gid = t["gid"]
         name = t.get("name", "")
-        claims_field = asana_task_field(t, ASANA_FIELD_CLAIMS_TEXT)
+        claims_field = asana_task_field(t, env("ASANA_FIELD_CLAIMS_TEXT"))
         claims_text = (claims_field.get("text_value") or "") if claims_field else ""
         slugs, needs_review = parse_claim_slugs(claims_text)
 
@@ -161,8 +177,8 @@ def sweep(pat, project_gid, svc, sid, dry_run=False):
         if dry_run:
             counters["rows_appended"] += len(to_append)
             continue
+        append_rows(svc, sid, gid, task_url, to_append, today_str)
         for s in to_append:
-            append_row(svc, sid, gid, task_url, s, today_str)
             existing.add((s.lower(), gid))
             counters["rows_appended"] += 1
 
@@ -171,6 +187,8 @@ def sweep(pat, project_gid, svc, sid, dry_run=False):
           f"unparseable={counters['unparseable']}  "
           f"reviews_posted={counters['review_comments_posted']}  "
           f"skipped_existing_pairs={counters['tasks_skipped']}")
+    if recorder is not None:
+        recorder.record(**counters)
     return counters
 
 
@@ -192,16 +210,21 @@ def main():
     p.add_argument("--max-sweeps", type=int, default=None, help="Stop after N sweeps (for testing)")
     a = p.parse_args()
 
+    setup_logging()
     load_env()
+    set_dry_run(a.dry_run)  # propagate to test_suite helpers
+    verify_lightdash()  # fail loud on misconfigured URL/key (no-op if unset)
     pat = env("ASANA_PAT")
     project_gid = env("ASANA_PROJECT_GID")
     sid = env("GOOGLE_SHEETS_SPREADSHEET_ID")
+    recorder_gid = env("ASANA_RECORDER_TASK_GID", required=False)
     svc = get_sheets_service()
 
     print("=" * 72); print("Asana WOIP Monitor"); print("=" * 72)
     print(f"  project:  {project_gid}")
-    print(f"  section:  WOIP ({ASANA_SECTION_WOIP})")
+    print(f"  section:  WOIP ({env('ASANA_SECTION_WOIP')})")
     print(f"  interval: {a.interval}s  loop={a.loop}  dry_run={a.dry_run}")
+    print(f"  recorder: {recorder_gid or '(unset — sweeps will not be logged to Asana)'}")
 
     signal.signal(signal.SIGINT, _on_sigterm)
     try:
@@ -211,7 +234,16 @@ def main():
 
     sweeps_done = 0
     while True:
-        sweep(pat, project_gid, svc, sid, dry_run=a.dry_run)
+        run_id = gen_run_id()
+        set_run_id(run_id)
+        recorder = RunRecorder(pat, run_id, "woip_sweep", task_gid=recorder_gid)
+        try:
+            sweep(pat, project_gid, svc, sid, dry_run=a.dry_run, recorder=recorder)
+            recorder.flush(status="success")
+        except Exception as e:
+            recorder.error(repr(e))
+            recorder.flush(status="error")
+            raise
         sweeps_done += 1
         if not a.loop:
             break

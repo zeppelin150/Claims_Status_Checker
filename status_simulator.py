@@ -39,10 +39,12 @@ except Exception:
 
 sys.path.insert(0, str(Path(__file__).absolute().parent))
 from test_suite import (  # noqa: E402
-    load_env, env, get_sheets_service, sh_read, sh_write,
+    load_env, env, get_sheets_service, sh_read, sh_batch_write, set_dry_run,
     LD_COLUMNS, LD_SLUG, LD_STATUS, LD_ADJ_DAY, LD_SUBMITTED,
     ACTIONABLE_STATUSES,
 )
+from claims_logging import setup_logging, gen_run_id, set_run_id  # noqa: E402
+from recorder import RunRecorder  # noqa: E402
 
 RUNS_FILE = Path(__file__).absolute().parent / ".seeder_runs.json"
 
@@ -154,11 +156,20 @@ def main():
     if a.seed is not None:
         random.seed(a.seed)
 
+    setup_logging()
     load_env()
+    set_dry_run(a.dry_run)  # propagate to test_suite helpers
     sid = env("GOOGLE_SHEETS_SPREADSHEET_ID")
     svc = get_sheets_service()
 
+    run_id = gen_run_id()
+    set_run_id(run_id)
+    pat = env("ASANA_PAT", required=False)
+    recorder_gid = env("ASANA_RECORDER_TASK_GID", required=False)
+    recorder = RunRecorder(pat, run_id, "status_simulator", task_gid=recorder_gid)
+
     print(); print("=" * 72); print("Status Simulator"); print("=" * 72)
+    print(f"  run_id: {run_id}")
 
     # Resolve run/scenario filter → set of slugs (or None if no filter)
     run_filter_slugs = None
@@ -211,12 +222,16 @@ def main():
     if a.dry_run:
         print("\n  (dry-run — no writes)"); return 0
 
-    # Write each updated row (A:G)
-    for row_num, row_vals in updates:
-        sh_write(svc, sid, f"'LightdashData'!A{row_num}:G{row_num}", [row_vals])
+    # Single batched write covering every flipped row (scattered indices).
+    batch = [(f"'LightdashData'!A{row_num}:G{row_num}", [row_vals])
+             for row_num, row_vals in updates]
+    sh_batch_write(svc, sid, batch)
 
     print(f"\n  ✔ Flipped {len(updates)} row(s).")
     print(f"  Next: run the pipeline (python3 test_suite.py e2e) to pick up the changes.")
+    recorder.record(rows_flipped=len(updates),
+                    mode="slug" if a.slug else ("count" if a.count else "percent"))
+    recorder.flush(status="success")
     return 0
 
 
