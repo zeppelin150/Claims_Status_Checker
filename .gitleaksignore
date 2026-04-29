@@ -1,0 +1,24 @@
+# .gitleaksignore — suppress known false positives.
+# Format: <commit-sha>:<file-path>:<rule-id>:<line-number>
+#
+# All entries below are at commit a1ddc25 (the first commit on this repo)
+# in test_suite.py lines 55-63. Those lines were the original Asana resource
+# GIDs (project, section, custom-field, and option IDs). Gitleaks's
+# `asana-client-id` rule pattern-matches the numeric format and flags them.
+#
+# These are NOT secrets:
+#   - Asana resource GIDs are public identifiers tied to a project/workspace.
+#   - Anyone with the ASANA_PAT can already enumerate them via the API.
+#   - They're equivalent to database table names — namespacing, not auth.
+#
+# The current code has them migrated to env vars (Phase 1.4); these entries
+# only suppress historical hits in commit a1ddc25.
+a1ddc25de1a8264aa089ccf8c9a0418b694e2564:test_suite.py:asana-client-id:55
+a1ddc25de1a8264aa089ccf8c9a0418b694e2564:test_suite.py:asana-client-id:56
+a1ddc25de1a8264aa089ccf8c9a0418b694e2564:test_suite.py:asana-client-id:57
+a1ddc25de1a8264aa089ccf8c9a0418b694e2564:test_suite.py:asana-client-id:58
+a1ddc25de1a8264aa089ccf8c9a0418b694e2564:test_suite.py:asana-client-id:59
+a1ddc25de1a8264aa089ccf8c9a0418b694e2564:test_suite.py:asana-client-id:60
+a1ddc25de1a8264aa089ccf8c9a0418b694e2564:test_suite.py:asana-client-id:61
+a1ddc25de1a8264aa089ccf8c9a0418b694e2564:test_suite.py:asana-client-id:62
+a1ddc25de1a8264aa089ccf8c9a0418b694e2564:test_suite.py:asana-client-id:63

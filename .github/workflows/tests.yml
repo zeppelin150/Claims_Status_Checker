@@ -19,11 +19,18 @@ on:
           - e2e
           - setup    # DESTRUCTIVE — wipes Sheet1 + LightdashData and re-seeds. Run only intentionally.
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
@@ -61,6 +68,10 @@ jobs:
 
       - name: Run integration tests
         env:
+          # User-controllable input — pass through env to block shell injection.
+          # Without this, the workflow_dispatch input was interpolated directly
+          # into the run: command. (zizmor template-injection finding fix.)
+          TEST_GROUP:                  ${{ github.event.inputs.test_group || 'all' }}
           LIGHTDASH_API_URL:           ${{ secrets.LIGHTDASH_API_URL }}
           LIGHTDASH_API_KEY:           ${{ secrets.LIGHTDASH_API_KEY }}
           LIGHTDASH_CHART_UUID:        ${{ secrets.LIGHTDASH_CHART_UUID }}
@@ -86,4 +97,4 @@ jobs:
           # Central log project (production ETL run records)
           ASANA_LOG_PROJECT_GID:       ${{ secrets.ASANA_LOG_PROJECT_GID }}
           CXOPS_NORMAL_CLAIMS_ETL_LOG_SECTION_GID: ${{ secrets.CXOPS_NORMAL_CLAIMS_ETL_LOG_SECTION_GID }}
-        run: python3 test_suite.py ${{ github.event.inputs.test_group || 'all' }}
+        run: python3 test_suite.py "$TEST_GROUP"

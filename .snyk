@@ -1,0 +1,31 @@
+# Snyk policy file — false-positive suppressions for this repo.
+# https://docs.snyk.io/manage-issues/policies/the-.snyk-file
+version: v1.25.0
+
+ignore:
+  # Snyk Code's python/Ssrf rule flags asana_seeder.py:528 and asana_seeder.py:658
+  # because argparse-derived values flow into urllib.request.urlopen via the
+  # asana_req helper.
+  #
+  # Why this is a false positive:
+  #   - The URL is hardcoded inside asana_req: f"https://app.asana.com/api/1.0{path}"
+  #   - The host is fixed; only the {path} suffix varies, and {path} is
+  #     internal-only ("/tasks", "/projects/{gid}", etc — not user-controlled).
+  #   - User-provided CLI args (--count, --run-id, etc) flow into the request
+  #     body, not the URL. SSRF requires URL host/path control.
+  #   - asana_seeder.py is a developer-only CLI tool, not a server endpoint.
+  #     There's no untrusted user supplying input over a network.
+  #
+  # Lift this ignore if asana_seeder.py ever becomes server-callable or starts
+  # accepting URLs as input.
+  'python/Ssrf':
+    - 'asana_seeder.py':
+        reason: >
+          False positive: URL hardcoded to https://app.asana.com/api/1.0;
+          only request body data flows from CLI args, not URL host.
+          Dev-only CLI tool, not a server endpoint.
+        expires: '2027-04-29T00:00:00.000Z'
+        created: '2026-04-29T00:00:00.000Z'
+
+# Patches and language-specific overrides go here if/when needed.
+patch: {}

@@ -525,7 +525,11 @@ def create_task(pat, project_gid, spec, discovery):
         "memberships": [{"project": project_gid, "section": sec_gid}],
         "projects": [project_gid],
     }
-    s, b = asana_req("POST", "/tasks", pat, body)
+    # Snyk Code flags this as SSRF — false positive. URL is hardcoded inside
+    # asana_req (https://app.asana.com/api/1.0); only the body varies, and the
+    # body is internal Asana data, not URL routing input. CLI-only dev tool.
+    # See .snyk for the policy entry.
+    s, b = asana_req("POST", "/tasks", pat, body)  # noqa: snyk python/Ssrf
     if s in (200, 201):
         return b.get("data", {}).get("gid"), None
     return None, f"{s} {str(b)[:300]}"
@@ -655,7 +659,9 @@ def run_seeder(count, run_id, dry_run, seed):
             all_sim_rows.extend(pkg["sim_rows"])
             continue
 
-        gid, err = create_task(pat, project_gid, pkg["spec"], discovery)
+        # Calls asana_req under the hood — Snyk Code SSRF false positive.
+        # URL is fixed; CLI-derived values flow into the body, not URL host.
+        gid, err = create_task(pat, project_gid, pkg["spec"], discovery)  # noqa: snyk python/Ssrf
         if err:
             print(f"    ✘ create failed: {err}")
             failures.append((scn_name, err))

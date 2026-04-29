@@ -1,13 +1,22 @@
 name: E2E Pipeline
 
-# Runs the full claim-return pipeline: read pending slugs from Sheet1, fetch
-# Lightdash (or sim), compute F-K, write back. Runs on cron and on demand.
+# Runs the full claim-return pipeline (test_suite.py e2e path): read pending
+# slugs from Sheet1, fetch Lightdash (or sim), compute F-K, write back.
 # Idempotent — only touches rows where column F (Return Check) is empty.
+#
+# NOTE: The CXOps_BPA_Normal_Claims_Status_ETL.py daily cron in tests.yml
+# is the canonical production ETL. This workflow runs the test_suite.py e2e
+# integration test on a more frequent cadence and is currently retained as
+# a safety net while the new ETL is being trusted in production. Retire
+# once the new ETL has run reliably for ~30 days.
 
 on:
   schedule:
     - cron: '7,22,37,52 * * * *'   # every ~15 min, off the :00/:30 marks
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: e2e-pipeline
@@ -17,8 +26,12 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
@@ -36,4 +49,13 @@ jobs:
           GOOGLE_SHEETS_SPREADSHEET_ID: ${{ secrets.GOOGLE_SHEETS_SPREADSHEET_ID }}
           ASANA_PAT:                    ${{ secrets.ASANA_PAT }}
           ASANA_PROJECT_GID:            ${{ secrets.ASANA_PROJECT_GID }}
+          ASANA_SECTION_NEW:            ${{ secrets.ASANA_SECTION_NEW }}
+          ASANA_SECTION_WOIP:           ${{ secrets.ASANA_SECTION_WOIP }}
+          ASANA_FIELD_CX_OPS:           ${{ secrets.ASANA_FIELD_CX_OPS }}
+          ASANA_FIELD_CLAIMS_TEXT:      ${{ secrets.ASANA_FIELD_CLAIMS_TEXT }}
+          ASANA_FIELD_ALL_RETURNED:     ${{ secrets.ASANA_FIELD_ALL_RETURNED }}
+          ASANA_OPT_WOIP:               ${{ secrets.ASANA_OPT_WOIP }}
+          ASANA_OPT_NEEDS_FOLLOWUP:     ${{ secrets.ASANA_OPT_NEEDS_FOLLOWUP }}
+          ASANA_OPT_RETURNED_YES:       ${{ secrets.ASANA_OPT_RETURNED_YES }}
+          ASANA_OPT_RETURNED_NO:        ${{ secrets.ASANA_OPT_RETURNED_NO }}
         run: python3 test_suite.py e2e
