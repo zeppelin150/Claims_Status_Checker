@@ -228,14 +228,20 @@ def build_slug_sql(slugs):
 # Google Sheets helpers
 # ---------------------------------------------------------------------------
 def _resolve_sa_source():
-    """Pick the service-account credentials source from env vars.
+    """Pick the Google credentials source from env vars.
 
-    Returns ('file', path) or ('json', raw_json_str). Raises with a clear
-    message if neither is set or if the file path doesn't exist. FILE wins
-    when both are set — used for local dev (pointing at a JSON on disk).
+    Returns one of:
+        ('file', path)           — service account JSON file on disk
+        ('json', raw_json_str)   — service account JSON inline
+        ('adc',  None)           — Application Default Credentials (your
+                                   gcloud user login). Best for dev machines
+                                   where you can't get a service account.
+
+    Precedence: FILE > JSON > ADC. Raises if none of the three is configured.
     """
     sa_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
     sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    use_adc = os.getenv("GOOGLE_USE_ADC", "").strip().lower() in ("true", "1", "yes")
     if sa_file:
         if not os.path.isfile(sa_file):
             raise RuntimeError(
@@ -244,21 +250,30 @@ def _resolve_sa_source():
         return ("file", sa_file)
     if sa_json:
         return ("json", sa_json)
+    if use_adc:
+        return ("adc", None)
     raise RuntimeError(
-        "Set GOOGLE_SERVICE_ACCOUNT_FILE (path on disk) "
-        "or GOOGLE_SERVICE_ACCOUNT_JSON (raw JSON contents) — neither found"
+        "No Google credentials configured. Set ONE of:\n"
+        "  GOOGLE_SERVICE_ACCOUNT_FILE  (path to SA JSON file on disk)\n"
+        "  GOOGLE_SERVICE_ACCOUNT_JSON  (raw SA JSON contents)\n"
+        "  GOOGLE_USE_ADC=true          (use gcloud user credentials — "
+        "run `gcloud auth application-default login` first)"
     )
 
 
 def get_sheets_service():
-    from google.oauth2.service_account import Credentials
     from googleapiclient.discovery import build
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     kind, value = _resolve_sa_source()
     if kind == "file":
+        from google.oauth2.service_account import Credentials
         creds = Credentials.from_service_account_file(value, scopes=scopes)
-    else:
+    elif kind == "json":
+        from google.oauth2.service_account import Credentials
         creds = Credentials.from_service_account_info(json.loads(value), scopes=scopes)
+    else:  # adc — Application Default Credentials (gcloud user login)
+        import google.auth
+        creds, _ = google.auth.default(scopes=scopes)
     return build("sheets", "v4", credentials=creds)
 
 def _sheets_retry(fn, max_retries=6):

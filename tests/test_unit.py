@@ -215,8 +215,37 @@ class TestResolveSASource:
     def test_raises_when_file_path_does_not_exist(self, monkeypatch):
         monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_FILE", "/nonexistent/path.json")
         monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_JSON", raising=False)
+        monkeypatch.delenv("GOOGLE_USE_ADC", raising=False)
         with pytest.raises(RuntimeError, match="not found"):
             ts._resolve_sa_source()
+
+    def test_adc_path_when_use_adc_true_and_others_unset(self, monkeypatch):
+        # Dev machines without GCP access use this path: gcloud user login.
+        monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_FILE", raising=False)
+        monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_JSON", raising=False)
+        monkeypatch.setenv("GOOGLE_USE_ADC", "true")
+        kind, value = ts._resolve_sa_source()
+        assert kind == "adc"
+        assert value is None
+
+    def test_file_still_wins_over_adc_when_both_set(self, monkeypatch, tmp_path):
+        sa_file = tmp_path / "sa.json"
+        sa_file.write_text("{}")
+        monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_FILE", str(sa_file))
+        monkeypatch.setenv("GOOGLE_USE_ADC", "true")
+        kind, _ = ts._resolve_sa_source()
+        assert kind == "file"
+
+    def test_error_message_mentions_all_three_options(self, monkeypatch):
+        monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_FILE", raising=False)
+        monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_JSON", raising=False)
+        monkeypatch.delenv("GOOGLE_USE_ADC", raising=False)
+        with pytest.raises(RuntimeError) as exc:
+            ts._resolve_sa_source()
+        msg = str(exc.value)
+        assert "GOOGLE_SERVICE_ACCOUNT_FILE" in msg
+        assert "GOOGLE_SERVICE_ACCOUNT_JSON" in msg
+        assert "GOOGLE_USE_ADC" in msg
 
 
 # ---------------------------------------------------------------------------
