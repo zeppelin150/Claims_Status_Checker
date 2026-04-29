@@ -252,6 +252,18 @@ def _resolve_sa_source():
         return ("json", sa_json)
     if use_adc:
         return ("adc", None)
+
+    # ━━━ TEMP DEMO FALLBACK ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # When no Google credentials are configured, fall back to ADC (gcloud
+    # user login) instead of raising. Lets the dev machine run the full
+    # pipeline against `gcloud auth application-default login` without any
+    # .env changes. REMOVE THIS BLOCK after the demo to restore strict
+    # config-required behavior.
+    print("[temp-demo-fallback] No SA credentials set — falling back to ADC. "
+          "Run `gcloud auth application-default login` if not already done.")
+    return ("adc", None)
+    # ━━━ END TEMP DEMO FALLBACK ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
     raise RuntimeError(
         "No Google credentials configured. Set ONE of:\n"
         "  GOOGLE_SERVICE_ACCOUNT_FILE  (path to SA JSON file on disk)\n"

@@ -206,9 +206,13 @@ class TestResolveSASource:
         assert kind == "json"
         assert "service_account" in value
 
+    @pytest.mark.skip(reason="Temp-demo-fallback in test_suite._resolve_sa_source "
+                             "currently returns ('adc', None) instead of raising. "
+                             "Re-enable this test when that block is removed post-demo.")
     def test_raises_when_neither_set(self, monkeypatch):
         monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_FILE", raising=False)
         monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_JSON", raising=False)
+        monkeypatch.delenv("GOOGLE_USE_ADC", raising=False)
         with pytest.raises(RuntimeError, match="GOOGLE_SERVICE_ACCOUNT"):
             ts._resolve_sa_source()
 
@@ -236,16 +240,20 @@ class TestResolveSASource:
         kind, _ = ts._resolve_sa_source()
         assert kind == "file"
 
-    def test_error_message_mentions_all_three_options(self, monkeypatch):
+    def test_temp_demo_fallback_returns_adc_when_nothing_set(self, monkeypatch, capsys):
+        """TEMP DEMO BEHAVIOR: with no SA env vars set, falls back to ADC
+        instead of raising. When the temp-demo-fallback block is removed
+        post-demo, this test should be deleted alongside it (and the
+        test_error_message_mentions_all_three_options test re-enabled)."""
         monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_FILE", raising=False)
         monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_JSON", raising=False)
         monkeypatch.delenv("GOOGLE_USE_ADC", raising=False)
-        with pytest.raises(RuntimeError) as exc:
-            ts._resolve_sa_source()
-        msg = str(exc.value)
-        assert "GOOGLE_SERVICE_ACCOUNT_FILE" in msg
-        assert "GOOGLE_SERVICE_ACCOUNT_JSON" in msg
-        assert "GOOGLE_USE_ADC" in msg
+        kind, value = ts._resolve_sa_source()
+        assert kind == "adc"
+        assert value is None
+        # The fallback prints a warning to stdout so the operator notices.
+        captured = capsys.readouterr()
+        assert "temp-demo-fallback" in captured.out
 
 
 # ---------------------------------------------------------------------------
