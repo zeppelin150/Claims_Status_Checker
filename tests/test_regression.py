@@ -416,21 +416,61 @@ class TestDryRunFlag:
 
 
 # ---------------------------------------------------------------------------
-# Phase 4.3 — test_11 actually closes the loop (no more "Would update")
+# Phase 4.3 — test_11 actually fires the field updates (no more "Would update")
 # Was: test_11_e2e Step 5 printed "Would update custom field" / "Would post
 # parent task comment" without ever doing it. Test 10 had the real updater
-# but was a separate test. Now test_11 invokes close_completed_tasks for real.
+# but was a separate test. Now test_11 invokes mark_tasks_ready_to_work for real.
 # ---------------------------------------------------------------------------
 def test_no_would_update_placeholder_strings_in_test_11():
     """Meta-test: the 'Would update'/'Would post' placeholder text from the
     old report-only Step 5 must not be in the source. Replaced by real
-    close_completed_tasks call."""
+    mark_tasks_ready_to_work call."""
     from pathlib import Path
     src = (Path(__file__).resolve().parent.parent / "test_suite.py").read_text(encoding="utf-8")
     assert 'Would update custom field' not in src, (
-        "test_11_e2e Step 5 should call close_completed_tasks, not print stubs"
+        "test_11_e2e Step 5 should call mark_tasks_ready_to_work, not print stubs"
     )
     assert 'Would post parent task comment' not in src
+
+
+# ---------------------------------------------------------------------------
+# mark_tasks_ready_to_work — must NOT call any Asana close/complete endpoint
+# This is the contract: the function updates two custom fields and posts a
+# comment. It does NOT mark the task complete, archive it, or close it.
+# Lock that in so a future "helpful" change doesn't add a /tasks/{gid}
+# completion call.
+# ---------------------------------------------------------------------------
+def test_mark_tasks_ready_to_work_never_calls_complete_endpoint(env_setup, monkeypatch):
+    """If the function ever starts marking tasks complete, this test catches it."""
+    from unittest.mock import MagicMock
+    monkeypatch.setattr(ts, "check_all_claims_returned",
+                        lambda gid, svc, sid: (True, 2, 2))
+
+    asana_calls = []
+    def fake_req(method, path, pat, body=None, **kw):
+        asana_calls.append((method, path, body))
+        if method == "GET":
+            # Return a state that's NOT yet "Yes", so the function will try to update.
+            return 200, {"data": {"custom_fields": []}}
+        return 200, {"data": {}}
+    monkeypatch.setattr(ts, "asana_req", fake_req)
+
+    svc = MagicMock()
+    rows = [["r1"], ["r2"]]
+    row = [""] * 26
+    row[4] = "abc123"; row[5] = "TRUE"; row[ts.COL_Z_INDEX] = "task-1"
+    rows.append(row)
+
+    ts.mark_tasks_ready_to_work(svc, "sid", "pat", rows, log=lambda _: None)
+
+    # The "complete" surface in the Asana API is `PUT /tasks/{gid}` with
+    # body {"completed": true}. Verify no such body ever shipped.
+    for method, path, body in asana_calls:
+        if isinstance(body, dict) and "completed" in body:
+            raise AssertionError(
+                f"mark_tasks_ready_to_work attempted to set 'completed' field "
+                f"on {path} — that would close the task, which violates the contract"
+            )
 
 
 # ---------------------------------------------------------------------------

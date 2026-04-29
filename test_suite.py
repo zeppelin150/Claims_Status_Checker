@@ -666,14 +666,28 @@ def calc_aging(days):
     if days is None: return ""
     return "Aging" if days > AGING_THRESHOLD_DAYS else "FALSE"
 
-def close_completed_tasks(svc, sid, pat, all_rows, log=print):
+def mark_tasks_ready_to_work(svc, sid, pat, all_rows, log=print):
     """For each unique task GID in the sheet whose claims have all returned
-    (every row with that GID in col Z has Return Check = TRUE), update the
-    Asana task: Have All Claims Returned → Yes, CX/OPs → needs follow-up,
-    post a confirmation comment. Idempotent — tasks already marked Yes are
-    skipped so this is safe to re-run.
+    (every row with that GID in col Z has Return Check = TRUE), set TWO
+    Asana custom fields so the task surfaces in the operator's "ready to
+    work" queue:
 
-    Returns counters dict. Honors the global dry-run flag through asana_req.
+        ASANA_FIELD_ALL_RETURNED → ASANA_OPT_RETURNED_YES
+        ASANA_FIELD_CX_OPS       → ASANA_OPT_NEEDS_FOLLOWUP
+
+    The task is NEVER marked complete in Asana. This function does NOT
+    archive, complete, or close the task. It only updates two custom-field
+    enum values so the operator's view changes from "waiting on insurance
+    partner" to "ready for follow-up" — the human still does the actual
+    work in Asana.
+
+    A confirmation comment is posted as an audit trail (states the run
+    happened and what the new state is). Drop the comment by setting
+    SKIP_AUTOMATION_COMMENT=true if it adds noise.
+
+    Idempotent — tasks already marked Yes are skipped, so this is safe
+    to re-run on every cron tick. Honors the global dry-run flag through
+    asana_req.
     """
     field_all_returned = env("ASANA_FIELD_ALL_RETURNED")
     opt_returned_yes = env("ASANA_OPT_RETURNED_YES")
@@ -688,18 +702,18 @@ def close_completed_tasks(svc, sid, pat, all_rows, log=print):
                 task_gids.add(gid)
 
     counters = {
-        "close_tasks_seen": len(task_gids),
-        "close_tasks_closed": 0,
-        "close_tasks_partial": 0,
-        "close_tasks_already_yes": 0,
-        "close_tasks_failed": 0,
+        "marked_tasks_seen": len(task_gids),
+        "marked_ready": 0,
+        "marked_partial": 0,
+        "marked_already_yes": 0,
+        "marked_failed": 0,
     }
     ts_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     for task_gid in sorted(task_gids):
         all_ret, total, returned = check_all_claims_returned(task_gid, svc, sid)
         if not all_ret or total == 0:
-            counters["close_tasks_partial"] += 1
+            counters["marked_partial"] += 1
             continue
 
         s, body = asana_req(
@@ -709,30 +723,32 @@ def close_completed_tasks(svc, sid, pat, all_rows, log=print):
         )
         if s != 200:
             log(f"    Task {task_gid}: fetch failed ({s})")
-            counters["close_tasks_failed"] += 1
+            counters["marked_failed"] += 1
             continue
 
         ret_field = asana_task_field(body.get("data", {}), field_all_returned)
         ev = (ret_field or {}).get("enum_value") or {}
         if ev.get("gid") == opt_returned_yes:
-            counters["close_tasks_already_yes"] += 1
+            counters["marked_already_yes"] += 1
             continue
 
+        # Two custom-field updates — this is the "mark ready to work" action.
         s1, _ = asana_update_field(pat, task_gid, field_all_returned, opt_returned_yes)
         s2, _ = asana_update_field(pat, task_gid, field_cx_ops, opt_needs_followup)
         s3, _ = asana_post_comment(
             pat, task_gid,
             f"[Automation] All {total} claim(s) have returned as of {ts_now}. "
-            f"Task updated to 'needs follow-up'.",
+            f"Task is now ready for follow-up. (Task is NOT closed — "
+            f"please work it as normal.)",
         )
 
         if s1 == 200 and s2 == 200:
-            counters["close_tasks_closed"] += 1
-            log(f"    ✔ Task {task_gid} closed ({total} claims) "
+            counters["marked_ready"] += 1
+            log(f"    ✔ Task {task_gid} marked ready ({total} claims) "
                 f"comment={'OK' if s3 in (200, 201) else f'FAILED ({s3})'}")
         else:
-            counters["close_tasks_failed"] += 1
-            log(f"    ✘ Task {task_gid} close failed (s1={s1} s2={s2})")
+            counters["marked_failed"] += 1
+            log(f"    ✘ Task {task_gid} mark-ready failed (s1={s1} s2={s2})")
 
     return counters
 

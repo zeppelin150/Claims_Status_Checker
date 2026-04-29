@@ -1,0 +1,653 @@
+name: Security Scan
+
+# ───────────────────────────────────────────────────────────────────────────
+# Comprehensive security scan: SCA, SAST, container, IaC, secrets, workflow
+# audit, SBOM. Drop into .github/workflows/security.yml. Portable across
+# repos — auto-detects what to scan.
+#
+# Required: repo secret  SNYK_TOKEN
+# Optional: repo vars    ENABLE_SCHEDULED_SCANS  (default: true)
+#                        MONITOR_ON_PUSH         (default: true)
+#                        SCAN_DEV_DEPS           (default: false)
+#
+# Hardening notes:
+# - All ${{ ... }} expressions that flow into `run:` blocks are passed
+#   through `env:` to prevent shell injection. Direct interpolation of
+#   user-controlled inputs (workflow_dispatch inputs, repo vars, step
+#   outputs derived from filenames) into shell scripts is a known
+#   GitHub Actions injection vector.
+# - actions/checkout uses persist-credentials: false where the workspace
+#   doesn't need to push back to the repo (all scan jobs).
+# ───────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [main, master, production]
+  pull_request:
+    branches: [main, master, production]
+  schedule:
+    - cron: '0 6 * * 1'     # Mon 06:00 UTC — gated by ENABLE_SCHEDULED_SCANS
+  workflow_dispatch:
+    inputs:
+      manifest_file:
+        description: 'Manifest path (blank = auto-detect)'
+        required: false
+        default: ''
+      package_manager:
+        description: 'pip|poetry|npm|yarn|gomodules|maven|gradle|rubygems (blank = auto-detect)'
+        required: false
+        default: ''
+      severity_threshold:
+        description: 'Minimum severity to report'
+        required: false
+        default: 'low'
+        type: choice
+        options: [low, medium, high, critical]
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # gate: cron toggle. Every other job depends on this.
+  # ─────────────────────────────────────────────────────────────────────────
+  gate:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule' || vars.ENABLE_SCHEDULED_SCANS != 'false'
+    steps:
+      - run: echo "Proceeding with security scan run"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # detect: figures out manifest, Dockerfile presence, IaC presence.
+  # ─────────────────────────────────────────────────────────────────────────
+  detect:
+    needs: gate
+    runs-on: ubuntu-latest
+    outputs:
+      manifest: ${{ steps.detect.outputs.manifest }}
+      package_manager: ${{ steps.detect.outputs.package_manager }}
+      has_manifest: ${{ steps.detect.outputs.has_manifest }}
+      has_dockerfile: ${{ steps.detect.outputs.has_dockerfile }}
+      has_iac: ${{ steps.detect.outputs.has_iac }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Detect ecosystem & artifacts
+        id: detect
+        env:
+          # User-controllable inputs — pass via env to prevent shell injection.
+          INPUT_MANIFEST: ${{ inputs.manifest_file }}
+          INPUT_PKG_MGR: ${{ inputs.package_manager }}
+        run: |
+          MANIFEST="$INPUT_MANIFEST"
+          PKG_MGR="$INPUT_PKG_MGR"
+          HAS_MANIFEST="false"
+
+          # Lockfiles before source manifests — exact pins beat version ranges.
+          if [ -z "$MANIFEST" ]; then
+            if   [ -f poetry.lock ];          then MANIFEST="poetry.lock";        PKG_MGR="${PKG_MGR:-poetry}";    HAS_MANIFEST="true"
+            elif [ -f Pipfile.lock ];         then MANIFEST="Pipfile.lock";       PKG_MGR="${PKG_MGR:-pip}";       HAS_MANIFEST="true"
+            elif [ -f pnpm-lock.yaml ];       then MANIFEST="pnpm-lock.yaml";     PKG_MGR="${PKG_MGR:-npm}";       HAS_MANIFEST="true"
+            elif [ -f yarn.lock ];            then MANIFEST="yarn.lock";          PKG_MGR="${PKG_MGR:-yarn}";      HAS_MANIFEST="true"
+            elif [ -f package-lock.json ];    then MANIFEST="package-lock.json";  PKG_MGR="${PKG_MGR:-npm}";       HAS_MANIFEST="true"
+            elif [ -f requirements.txt ];     then MANIFEST="requirements.txt";   PKG_MGR="${PKG_MGR:-pip}";       HAS_MANIFEST="true"
+            elif [ -f Gemfile.lock ];         then MANIFEST="Gemfile.lock";       PKG_MGR="${PKG_MGR:-rubygems}";  HAS_MANIFEST="true"
+            elif [ -f go.sum ];               then MANIFEST="go.mod";             PKG_MGR="${PKG_MGR:-gomodules}"; HAS_MANIFEST="true"
+            elif [ -f pom.xml ];              then MANIFEST="pom.xml";            PKG_MGR="${PKG_MGR:-maven}";     HAS_MANIFEST="true"
+            elif [ -f build.gradle.kts ];     then MANIFEST="build.gradle.kts";   PKG_MGR="${PKG_MGR:-gradle}";    HAS_MANIFEST="true"
+            elif [ -f build.gradle ];         then MANIFEST="build.gradle";       PKG_MGR="${PKG_MGR:-gradle}";    HAS_MANIFEST="true"
+            else
+              echo "::warning::No supported manifest found — SCA scan will be skipped"
+            fi
+          else
+            HAS_MANIFEST="true"
+          fi
+
+          HAS_DOCKERFILE="false"
+          if [ -f Dockerfile ] || [ -f dockerfile ]; then
+            HAS_DOCKERFILE="true"
+          fi
+
+          HAS_IAC="false"
+          if find . -type d \( -name node_modules -o -name .git -o -name vendor \) -prune -o \
+                    -type f \( -name "*.tf" -o -name "*.tfvars" -o -name "Chart.yaml" \
+                              -o -path "*/templates/*.yaml" -o -path "*/templates/*.yml" \
+                              -o -name "serverless.yml" -o -name "serverless.yaml" \) -print 2>/dev/null \
+             | grep -q .; then
+            HAS_IAC="true"
+          fi
+
+          {
+            echo "manifest=$MANIFEST"
+            echo "package_manager=$PKG_MGR"
+            echo "has_manifest=$HAS_MANIFEST"
+            echo "has_dockerfile=$HAS_DOCKERFILE"
+            echo "has_iac=$HAS_IAC"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Detection"
+            echo "- manifest: \`$MANIFEST\` ($PKG_MGR)"
+            echo "- Dockerfile: $HAS_DOCKERFILE"
+            echo "- IaC files: $HAS_IAC"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # deps: SCA + monitor.
+  # ─────────────────────────────────────────────────────────────────────────
+  deps:
+    needs: detect
+    if: needs.detect.outputs.has_manifest == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        if: contains(fromJSON('["pip","poetry"]'), needs.detect.outputs.package_manager)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install CPU-only PyTorch (only if torch is in deps)
+        if: needs.detect.outputs.package_manager == 'pip'
+        env:
+          MANIFEST: ${{ needs.detect.outputs.manifest }}
+        run: |
+          if grep -qE '^[[:space:]]*torch([[:space:]<>=!~]|$)' "$MANIFEST" 2>/dev/null; then
+            echo "torch found — installing CPU wheel"
+            pip install --index-url https://download.pytorch.org/whl/cpu torch
+          else
+            echo "torch not in deps — skipping"
+          fi
+
+      - name: Install dependencies (pip)
+        if: needs.detect.outputs.package_manager == 'pip'
+        env:
+          MANIFEST: ${{ needs.detect.outputs.manifest }}
+        run: pip install -r "$MANIFEST"
+
+      - name: Install dependencies (poetry)
+        if: needs.detect.outputs.package_manager == 'poetry'
+        run: |
+          pip install poetry
+          poetry install --no-interaction --no-root
+
+      - name: Install dependencies (npm)
+        if: needs.detect.outputs.package_manager == 'npm'
+        run: npm ci || npm install
+
+      - name: Install dependencies (yarn)
+        if: needs.detect.outputs.package_manager == 'yarn'
+        run: |
+          corepack enable
+          yarn install --frozen-lockfile
+
+      - name: Install Snyk CLI
+        run: npm install -g snyk
+
+      - name: Snyk SCA test (JSON)
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          MANIFEST: ${{ needs.detect.outputs.manifest }}
+          PKG_MGR: ${{ needs.detect.outputs.package_manager }}
+          SCAN_DEV_DEPS: ${{ vars.SCAN_DEV_DEPS }}
+          SEVERITY: ${{ inputs.severity_threshold || 'low' }}
+        run: |
+          DEV_FLAG=""
+          if [ "$SCAN_DEV_DEPS" = "true" ]; then DEV_FLAG="--dev"; fi
+          snyk test \
+            --file="$MANIFEST" \
+            --package-manager="$PKG_MGR" \
+            --skip-unresolved \
+            $DEV_FLAG \
+            --json-file-output=snyk-sca.json \
+            --severity-threshold="$SEVERITY" || true
+
+      - name: Snyk SCA test (SARIF)
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          MANIFEST: ${{ needs.detect.outputs.manifest }}
+          PKG_MGR: ${{ needs.detect.outputs.package_manager }}
+          SCAN_DEV_DEPS: ${{ vars.SCAN_DEV_DEPS }}
+        run: |
+          DEV_FLAG=""
+          if [ "$SCAN_DEV_DEPS" = "true" ]; then DEV_FLAG="--dev"; fi
+          snyk test \
+            --file="$MANIFEST" \
+            --package-manager="$PKG_MGR" \
+            --skip-unresolved \
+            $DEV_FLAG \
+            --sarif-file-output=snyk-sca.sarif || true
+
+      - name: Snyk monitor (push to main / cron only)
+        if: |
+          (github.event_name == 'push' || github.event_name == 'schedule')
+          && vars.MONITOR_ON_PUSH != 'false'
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          MANIFEST: ${{ needs.detect.outputs.manifest }}
+          PKG_MGR: ${{ needs.detect.outputs.package_manager }}
+          PROJECT_NAME: ${{ github.repository }}
+        run: |
+          snyk monitor \
+            --file="$MANIFEST" \
+            --package-manager="$PKG_MGR" \
+            --skip-unresolved \
+            --project-name="$PROJECT_NAME" || true
+
+      - name: Upload SCA artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-sca
+          path: |
+            snyk-sca.json
+            snyk-sca.sarif
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Upload SCA SARIF to Code Scanning
+        if: always() && hashFiles('snyk-sca.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: snyk-sca.sarif
+          category: snyk-sca
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # code: SAST.
+  # ─────────────────────────────────────────────────────────────────────────
+  code:
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - run: npm install -g snyk
+
+      - name: Snyk Code test (SARIF)
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          SEVERITY: ${{ inputs.severity_threshold || 'low' }}
+        run: |
+          snyk code test \
+            --sarif-file-output=snyk-code.sarif \
+            --severity-threshold="$SEVERITY" || true
+
+      - name: Upload Snyk Code SARIF to Code Scanning
+        if: always() && hashFiles('snyk-code.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: snyk-code.sarif
+          category: snyk-code
+
+      - name: Upload Snyk Code artifact
+        if: always() && hashFiles('snyk-code.sarif') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-code
+          path: snyk-code.sarif
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # container: scan base image from Dockerfile's last FROM.
+  # ─────────────────────────────────────────────────────────────────────────
+  container:
+    needs: detect
+    if: needs.detect.outputs.has_dockerfile == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - run: npm install -g snyk
+
+      - name: Extract base image from Dockerfile
+        id: baseimg
+        run: |
+          DOCKERFILE="Dockerfile"
+          [ -f dockerfile ] && DOCKERFILE="dockerfile"
+          # Last FROM line = production base in multistage builds.
+          BASE_IMAGE=$(grep -iE '^[[:space:]]*FROM' "$DOCKERFILE" | tail -1 | awk '{print $2}')
+          echo "image=$BASE_IMAGE" >> "$GITHUB_OUTPUT"
+          echo "dockerfile=$DOCKERFILE" >> "$GITHUB_OUTPUT"
+          echo "Scanning base image: $BASE_IMAGE"
+
+      - name: Snyk container test (SARIF)
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          BASE_IMAGE: ${{ steps.baseimg.outputs.image }}
+          DOCKERFILE: ${{ steps.baseimg.outputs.dockerfile }}
+          SEVERITY: ${{ inputs.severity_threshold || 'low' }}
+        run: |
+          snyk container test "$BASE_IMAGE" \
+            --file="$DOCKERFILE" \
+            --sarif-file-output=snyk-container.sarif \
+            --severity-threshold="$SEVERITY" || true
+
+      - name: Upload container SARIF to Code Scanning
+        if: always() && hashFiles('snyk-container.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: snyk-container.sarif
+          category: snyk-container
+
+      - name: Upload container artifact
+        if: always() && hashFiles('snyk-container.sarif') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-container
+          path: snyk-container.sarif
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # iac: Terraform / K8s / CloudFormation / Helm.
+  # ─────────────────────────────────────────────────────────────────────────
+  iac:
+    needs: detect
+    if: needs.detect.outputs.has_iac == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - run: npm install -g snyk
+
+      - name: Snyk IaC test (SARIF)
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          SEVERITY: ${{ inputs.severity_threshold || 'low' }}
+        run: |
+          snyk iac test . \
+            --sarif-file-output=snyk-iac.sarif \
+            --severity-threshold="$SEVERITY" || true
+
+      - name: Upload IaC SARIF to Code Scanning
+        if: always() && hashFiles('snyk-iac.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: snyk-iac.sarif
+          category: snyk-iac
+
+      - name: Upload IaC artifact
+        if: always() && hashFiles('snyk-iac.sarif') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-iac
+          path: snyk-iac.sarif
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # secrets: gitleaks.
+  # ─────────────────────────────────────────────────────────────────────────
+  secrets:
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks
+        run: |
+          GITLEAKS_VERSION="8.21.2"
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      - name: Run gitleaks (SARIF)
+        continue-on-error: true
+        run: |
+          gitleaks detect \
+            --source . \
+            --report-format sarif \
+            --report-path gitleaks.sarif \
+            --redact \
+            --exit-code 0
+
+      - name: Upload gitleaks SARIF to Code Scanning
+        if: always() && hashFiles('gitleaks.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+      - name: Upload gitleaks artifact
+        if: always() && hashFiles('gitleaks.sarif') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks
+          path: gitleaks.sarif
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # workflow-audit: zizmor.
+  # ─────────────────────────────────────────────────────────────────────────
+  workflow-audit:
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install zizmor
+        run: pip install zizmor
+
+      - name: Run zizmor (SARIF)
+        continue-on-error: true
+        run: |
+          zizmor --format sarif .github/workflows/ > zizmor.sarif || true
+
+      - name: Upload zizmor SARIF to Code Scanning
+        if: always() && hashFiles('zizmor.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: zizmor.sarif
+          category: zizmor
+
+      - name: Upload zizmor artifact
+        if: always() && hashFiles('zizmor.sarif') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: zizmor
+          path: zizmor.sarif
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # sbom: CycloneDX + SPDX via syft.
+  # ─────────────────────────────────────────────────────────────────────────
+  sbom:
+    needs: detect
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Generate SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          artifact-name: sbom-cyclonedx.json
+          output-file: sbom-cyclonedx.json
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          artifact-name: sbom-spdx.json
+          output-file: sbom-spdx.json
+
+      - name: Upload SBOMs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            sbom-cyclonedx.json
+            sbom-spdx.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # summary: aggregate report.
+  # ─────────────────────────────────────────────────────────────────────────
+  summary:
+    needs: [detect, deps, code, container, iac, secrets, workflow-audit, sbom]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+        continue-on-error: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build summary
+        env:
+          # GitHub-context values (not user-controllable, but env-var'd for
+          # consistency with the hardening rule and to make the script
+          # injection-safe regardless of source).
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+          TRIGGER: ${{ github.event_name }}
+          RESULT_DEPS: ${{ needs.deps.result }}
+          RESULT_CODE: ${{ needs.code.result }}
+          RESULT_CONTAINER: ${{ needs.container.result }}
+          RESULT_IAC: ${{ needs.iac.result }}
+          RESULT_SECRETS: ${{ needs.secrets.result }}
+          RESULT_WF_AUDIT: ${{ needs.workflow-audit.result }}
+          RESULT_SBOM: ${{ needs.sbom.result }}
+        run: |
+          {
+            echo "## 🛡️ Security Scan Summary"
+            echo ""
+            echo "**Repo:** $REPO"
+            echo "**Branch:** $BRANCH"
+            echo "**Commit:** $COMMIT"
+            echo "**Trigger:** $TRIGGER"
+            echo "**Date:** $(date -u)"
+            echo ""
+            echo "### Job results"
+            echo ""
+            echo "| Scan | Status |"
+            echo "|------|--------|"
+            echo "| SCA (deps)        | $RESULT_DEPS |"
+            echo "| SAST (code)       | $RESULT_CODE |"
+            echo "| Container         | $RESULT_CONTAINER |"
+            echo "| IaC               | $RESULT_IAC |"
+            echo "| Secrets           | $RESULT_SECRETS |"
+            echo "| Workflow audit    | $RESULT_WF_AUDIT |"
+            echo "| SBOM              | $RESULT_SBOM |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          python3 << 'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json, os, glob
+
+          severity_emoji = {
+              "critical": "🔴", "error": "🔴",
+              "high": "🟠",
+              "medium": "🟡", "warning": "🟡",
+              "low": "🔵", "note": "🔵", "info": "🔵",
+          }
+
+          rows = []
+          for sarif_path in sorted(glob.glob("artifacts/**/*.sarif", recursive=True)):
+              tool = os.path.basename(sarif_path).replace(".sarif", "")
+              try:
+                  with open(sarif_path) as f:
+                      data = json.load(f)
+              except Exception as e:
+                  rows.append((tool, "?", f"parse error: {e}"))
+                  continue
+
+              counts = {}
+              for run in data.get("runs", []):
+                  for r in run.get("results", []):
+                      level = r.get("level", "warning")
+                      sev = r.get("properties", {}).get("security-severity")
+                      if sev:
+                          try:
+                              s = float(sev)
+                              if s >= 9.0: bucket = "critical"
+                              elif s >= 7.0: bucket = "high"
+                              elif s >= 4.0: bucket = "medium"
+                              else: bucket = "low"
+                          except ValueError:
+                              bucket = level
+                      else:
+                          bucket = level
+                      counts[bucket] = counts.get(bucket, 0) + 1
+
+              total = sum(counts.values())
+              breakdown = ", ".join(
+                  f"{severity_emoji.get(k,'')} {k}: {v}"
+                  for k, v in sorted(counts.items())
+              ) or "none"
+              rows.append((tool, total, breakdown))
+
+          if rows:
+              print("### Findings")
+              print("")
+              print("| Tool | Total | Breakdown |")
+              print("|------|-------|-----------|")
+              for tool, total, breakdown in rows:
+                  print(f"| `{tool}` | {total} | {breakdown} |")
+              print("")
+              print("Full results in **Security → Code scanning** and downloadable as artifacts.")
+          else:
+              print("No SARIF results to aggregate.")
+          EOF

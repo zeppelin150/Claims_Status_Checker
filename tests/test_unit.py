@@ -738,10 +738,12 @@ class TestCheckStaleClaims:
 
 
 # ---------------------------------------------------------------------------
-# close_completed_tasks — Step 5 of the e2e pipeline
+# mark_tasks_ready_to_work — Step 5 of the e2e pipeline
 # ---------------------------------------------------------------------------
-class TestCloseCompletedTasks:
-    """Tests the real closure path that test_11 used to fake with prints."""
+class TestMarkTasksReadyToWork:
+    """Tests the field-update path that test_11 used to fake with prints.
+    Asserts the task is NEVER closed/completed/archived — only two custom
+    field updates and a confirmation comment."""
 
     def _row(self, slug, return_check, task_gid):
         row = [""] * 26
@@ -778,10 +780,10 @@ class TestCloseCompletedTasks:
             self._row("ghi789", "TRUE", "1111111111111111"),
         )
 
-        counters = ts.close_completed_tasks(mock_sheets_svc, "sid", "pat",
+        counters = ts.mark_tasks_ready_to_work(mock_sheets_svc, "sid", "pat",
                                              rows, log=lambda _: None)
-        assert counters["close_tasks_closed"] == 1
-        assert counters["close_tasks_seen"] == 1
+        assert counters["marked_ready"] == 1
+        assert counters["marked_tasks_seen"] == 1
 
         methods = [m for m, _, _ in asana_calls]
         assert methods.count("PUT") == 2  # two field updates
@@ -798,10 +800,10 @@ class TestCloseCompletedTasks:
             self._row("abc123", "TRUE", "1111111111111111"),
             self._row("def456", "FALSE", "1111111111111111"),
         )
-        counters = ts.close_completed_tasks(mock_sheets_svc, "sid", "pat",
+        counters = ts.mark_tasks_ready_to_work(mock_sheets_svc, "sid", "pat",
                                              rows, log=lambda _: None)
-        assert counters["close_tasks_partial"] == 1
-        assert counters["close_tasks_closed"] == 0
+        assert counters["marked_partial"] == 1
+        assert counters["marked_ready"] == 0
         assert asana_calls == []  # no API calls for partial tasks
 
     def test_skips_task_already_marked_yes(self, mock_sheets_svc, env_setup, monkeypatch):
@@ -825,10 +827,10 @@ class TestCloseCompletedTasks:
         monkeypatch.setattr(ts, "asana_req", fake_asana_req)
 
         rows = self._sheet_rows(self._row("abc123", "TRUE", "1111111111111111"))
-        counters = ts.close_completed_tasks(mock_sheets_svc, "sid", "pat",
+        counters = ts.mark_tasks_ready_to_work(mock_sheets_svc, "sid", "pat",
                                              rows, log=lambda _: None)
-        assert counters["close_tasks_already_yes"] == 1
-        assert counters["close_tasks_closed"] == 0
+        assert counters["marked_already_yes"] == 1
+        assert counters["marked_ready"] == 0
         # Only the GET happened — no PUT/POST after we saw already-Yes.
         methods = [m for m, _ in asana_calls]
         assert "PUT" not in methods
@@ -849,11 +851,11 @@ class TestCloseCompletedTasks:
             monkeypatch.setattr(ts, "_asana_req_once", fake_once)
 
             rows = self._sheet_rows(self._row("abc123", "TRUE", "1111111111111111"))
-            counters = ts.close_completed_tasks(mock_sheets_svc, "sid", "pat",
+            counters = ts.mark_tasks_ready_to_work(mock_sheets_svc, "sid", "pat",
                                                  rows, log=lambda _: None)
 
             # Closure was attempted (counted) but no PUT/POST reached _asana_req_once.
-            assert counters["close_tasks_closed"] == 1
+            assert counters["marked_ready"] == 1
             methods = [m for m, _ in once_calls]
             assert "PUT" not in methods
             assert "POST" not in methods
@@ -863,6 +865,6 @@ class TestCloseCompletedTasks:
     def test_no_task_gids_returns_zero_seen(self, mock_sheets_svc, env_setup, monkeypatch):
         monkeypatch.setattr(ts, "check_all_claims_returned", lambda *a: (False, 0, 0))
         rows = [["r1"], ["r2"]]  # no data rows
-        counters = ts.close_completed_tasks(mock_sheets_svc, "sid", "pat",
+        counters = ts.mark_tasks_ready_to_work(mock_sheets_svc, "sid", "pat",
                                              rows, log=lambda _: None)
-        assert counters["close_tasks_seen"] == 0
+        assert counters["marked_tasks_seen"] == 0

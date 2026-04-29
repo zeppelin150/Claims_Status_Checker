@@ -18,8 +18,13 @@ Pipeline (Lightdash → Sheet → Asana, all in one pass):
     3. Compute F-K (Return Check, Ticket counts, Aging, Send-to-Aging).
     4. Write F-K back to the sheet (one batched call).
     4b. Stale-claim check (track no-data slugs, post 30-day notification).
-    5. Close completed Asana tasks (Have All Claims Returned → Yes,
-       CX/OPs → needs follow-up, post confirmation comment).
+    5. Mark tasks ready to work — for tasks whose claims have all returned,
+       update TWO custom Asana fields:
+           ASANA_FIELD_ALL_RETURNED → ASANA_OPT_RETURNED_YES
+           ASANA_FIELD_CX_OPS       → ASANA_OPT_NEEDS_FOLLOWUP
+       The Asana task is NEVER closed/completed/archived by this script.
+       Operators continue to work the task; only the custom-field state
+       changes so the task surfaces in the right operator queue.
 
 Modes (controlled by env vars):
 
@@ -74,7 +79,7 @@ sys.path.insert(0, str(Path(__file__).absolute().parent))
 from test_suite import (  # noqa: E402
     load_env, env, set_dry_run, has_lightdash, verify_lightdash,
     _get_claim_data_api, get_sheets_service, sh_read, xval,
-    write_fk_batched, check_stale_claims, close_completed_tasks,
+    write_fk_batched, check_stale_claims, mark_tasks_ready_to_work,
     DATA_START_ROW, LD_SLUG,
 )
 from claims_logging import setup_logging, gen_run_id, set_run_id  # noqa: E402
@@ -210,9 +215,9 @@ def run_pipeline(recorder: RunRecorder, mode: dict) -> None:
                                          log=recorder.log_action)
     recorder.record(fk_matched=matched, fk_no_data=no_data)
 
-    # Single-row mode stops here — no stale check, no Asana close.
+    # Single-row mode stops here — no stale check, no Asana field updates.
     if mode["is_single_row"]:
-        recorder.log_action("single-row mode: skipping stale check and Asana close")
+        recorder.log_action("single-row mode: skipping stale check and Asana mark-ready")
         return
 
     # Step 4b: stale-claim check (only when there are no-data slugs).
@@ -221,11 +226,12 @@ def run_pipeline(recorder: RunRecorder, mode: dict) -> None:
                                     log=recorder.log_action)
         recorder.record(**stale)
 
-    # Step 5: close Asana tasks whose claims are all returned.
+    # Step 5: mark Asana tasks ready to work (two custom-field updates;
+    # task is NOT closed / completed / archived).
     all_rows_after = sh_read(svc, sid, "Sheet1!A:Z")
-    close = close_completed_tasks(svc, sid, pat, all_rows_after,
-                                   log=recorder.log_action)
-    recorder.record(**close)
+    mark = mark_tasks_ready_to_work(svc, sid, pat, all_rows_after,
+                                     log=recorder.log_action)
+    recorder.record(**mark)
 
 
 # ───────────────────────────────────────────────────────────────────────────
